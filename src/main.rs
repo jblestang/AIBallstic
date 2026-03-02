@@ -3,6 +3,7 @@ mod missiles;
 use bevy::prelude::*;
 use bevy_egui::{egui, EguiContexts, EguiPlugin};
 use glam::{DVec3, Vec3};
+use nalgebra::{SMatrix, SVector};
 use std::f32::consts::PI;
 use missiles::*;
 use chrono::{Datelike, Timelike, Utc};
@@ -48,6 +49,9 @@ pub struct ActiveMissileSpecs(pub MissileSpecs);
 struct TrackedMissileState {
     pub position_ecef: Option<DVec3>,
     pub velocity_ecef: Option<DVec3>,
+    // EKF 6D State [x, y, z, vx, vy, vz] and Covariance Matrix
+    pub ekf_state: Option<SVector<f64, 6>>,
+    pub ekf_covariance: Option<SMatrix<f64, 6, 6>>,
 }
 
 #[derive(Resource, Default)]
@@ -277,6 +281,7 @@ fn physics_system(
 // Radar & Impact Prediction Systems
 // ----------------------------------------------------------------------------
 
+#[allow(non_snake_case)]
 fn radar_scan_system(
     time: Res<Time>,
     mut radar_query: Query<&mut RadarStation>,
@@ -301,32 +306,101 @@ fn radar_scan_system(
                 let dist = radar.position_ecef.distance(missile.position_ecef);
                 
                 // Simple Line of Sight Check (is it above the horizon from radar's perspective?)
-                // and within maximum radar range (5000km).
                 let radar_norm = radar.position_ecef.normalize();
                 let vec_to_missile = (missile.position_ecef - radar.position_ecef).normalize();
                 let is_above_horizon = radar_norm.dot(vec_to_missile) > 0.0;
                 
                 if dist <= radar.range && is_above_horizon {
                     // Radar has acquired the target! Update tracked state with NOISE.
-                    // A real radar only measures positional/kinematic data with some CEP error.
                     use rand::Rng;
                     let mut rng = rand::thread_rng();
-                    
-                    // Simple uniform noise: +/- 1000 meters for position, +/- 50 m/s for velocity
+
+                    // Raw noisy measurement
                     let pos_noise = DVec3::new(
-                        rng.gen_range(-1000.0..1000.0),
-                        rng.gen_range(-1000.0..1000.0),
-                        rng.gen_range(-1000.0..1000.0)
+                        rng.gen_range(-1000.0..1000.0), rng.gen_range(-1000.0..1000.0), rng.gen_range(-1000.0..1000.0)
                     );
-                    
                     let vel_noise = DVec3::new(
-                        rng.gen_range(-50.0..50.0),
-                        rng.gen_range(-50.0..50.0),
-                        rng.gen_range(-50.0..50.0)
+                        rng.gen_range(-50.0..50.0), rng.gen_range(-50.0..50.0), rng.gen_range(-50.0..50.0)
                     );
                     
-                    tracked_state.position_ecef = Some(missile.position_ecef + pos_noise);
-                    tracked_state.velocity_ecef = Some(missile.velocity_ecef + vel_noise);
+                    let measured_pos = missile.position_ecef + pos_noise;
+                    let measured_vel = missile.velocity_ecef + vel_noise;
+                    
+                    let z = SVector::<f64, 6>::new(
+                        measured_pos.x, measured_pos.y, measured_pos.z,
+                        measured_vel.x, measured_vel.y, measured_vel.z
+                    );
+
+                    // Measurement Noise Covariance R (Pos variance ~ (1000^2)/12 = 83333, Vel ~ (100^2)/12 = 833)
+                    // Let's use simpler explicit bounds
+                    let mut R = SMatrix::<f64, 6, 6>::zeros();
+                    R[(0,0)] = 85_000.0; R[(1,1)] = 85_000.0; R[(2,2)] = 85_000.0;
+                    R[(3,3)] = 850.0;    R[(4,4)] = 850.0;    R[(5,5)] = 850.0;
+
+                    if tracked_state.ekf_state.is_none() {
+                        // First acquisition: Initialize EKF directly to measurement
+                        tracked_state.ekf_state = Some(z);
+                        tracked_state.ekf_covariance = Some(R); // Initial uncertainty equals measurement noise
+                    } else {
+                        // EKF Predict & Update Step
+                        let mut x = tracked_state.ekf_state.unwrap();
+                        let mut P = tracked_state.ekf_covariance.unwrap();
+                        
+                        // 1. Predict Step (Propagate state 1 second forward)
+                        let mut x_pred = x;
+                        let pos = DVec3::new(x[0], x[1], x[2]);
+                        let vel = DVec3::new(x[3], x[4], x[5]);
+                        
+                        // Simple 1 sec integration using generic bounds
+                        let r = pos.length();
+                        let altitude = (r - EARTH_RADIUS).max(0.0);
+                        let gravity = -pos.normalize() * (GRAVITY_CONSTANT / (r * r));
+                        
+                        let (rho, sound, _) = get_isa_properties(altitude);
+                        let mach = vel.length() / sound;
+                        let cd = get_mach_drag(mach);
+                        let drag_force = -0.5 * rho * vel.length_squared() * cd * 0.5; // est area 0.5
+                        let drag_accel = if vel.length() > 1e-3 { (vel.normalize() * drag_force) / 500.0 } else { DVec3::ZERO }; // est mass 500
+
+                        // For simplicity, skip Coriolis in EKF prediction to save Jacobian complexity, or treat as noise.
+                        let total_accel = gravity + drag_accel;
+                        
+                        // New predicted state
+                        x_pred[0] += vel.x * 1.0; x_pred[1] += vel.y * 1.0; x_pred[2] += vel.z * 1.0;
+                        x_pred[3] += total_accel.x * 1.0; x_pred[4] += total_accel.y * 1.0; x_pred[5] += total_accel.z * 1.0;
+
+                        // Process Noise Covariance Q (uncertainty in our physics model vs reality)
+                        let mut Q = SMatrix::<f64, 6, 6>::zeros();
+                        Q[(0,0)] = 100.0; Q[(1,1)] = 100.0; Q[(2,2)] = 100.0;
+                        Q[(3,3)] = 10.0;  Q[(4,4)] = 10.0;  Q[(5,5)] = 10.0;
+                        
+                        // Numerical Jacobian F for State Transition mapping
+                        let mut F = SMatrix::<f64, 6, 6>::identity();
+                        // Position derives from Velocity over dt=1.0
+                        F[(0,3)] = 1.0; F[(1,4)] = 1.0; F[(2,5)] = 1.0;
+                        // For a rigid setup, we can approximate the rest of F as identity to save deep partial derivatives
+                        // as the updates are fast enough (1Hz) that P won't diverge entirely on Q alone.
+                        
+                        let P_pred = F * P * F.transpose() + Q;
+
+                        // 2. Update Step
+                        let H = SMatrix::<f64, 6, 6>::identity(); // We measure all states directly
+                        let S = H * P_pred * H.transpose() + R;
+                        let K = P_pred * H.transpose() * S.try_inverse().unwrap_or(SMatrix::identity()); // Kalman Gain
+                        
+                        let y = z - (H * x_pred); // Innovation
+                        x = x_pred + K * y;
+                        let I = SMatrix::<f64, 6, 6>::identity();
+                        P = (I - K * H) * P_pred;
+
+                        tracked_state.ekf_state = Some(x);
+                        tracked_state.ekf_covariance = Some(P);
+                    }
+                    
+                    // Expose the clean filtered states for prediction engine
+                    let final_x = tracked_state.ekf_state.unwrap();
+                    tracked_state.position_ecef = Some(DVec3::new(final_x[0], final_x[1], final_x[2]));
+                    tracked_state.velocity_ecef = Some(DVec3::new(final_x[3], final_x[4], final_x[5]));
                 }
             }
         }
@@ -338,13 +412,14 @@ fn impact_prediction_system(
     mut prediction: ResMut<ImpactPrediction>,
     settings: Res<SimulationSettings>,
 ) {
-    // Only run the prediction if the tracked state has been updated.
-    if !tracked_state.is_changed() || tracked_state.position_ecef.is_none() {
+    // Only run the prediction if the EKF state has been updated.
+    if !tracked_state.is_changed() || tracked_state.ekf_state.is_none() {
         return;
     }
     
-    let base_pos = tracked_state.position_ecef.unwrap();
-    let base_vel = tracked_state.velocity_ecef.unwrap();
+    let ekf = tracked_state.ekf_state.unwrap();
+    let base_pos = DVec3::new(ekf[0], ekf[1], ekf[2]);
+    let base_vel = DVec3::new(ekf[3], ekf[4], ekf[5]);
     
     // Clear previous predictions
     prediction.coordinates_ecef.clear();
