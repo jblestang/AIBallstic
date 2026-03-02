@@ -230,6 +230,25 @@ pub const DF_17_SPECS: MissileSpecs = MissileSpecs {
     boost_loft_factor: 1.1,
 };
 
+pub fn get_missile_registry() -> Vec<MissileSpecs> {
+    vec![
+        SCUD_C_SPECS,
+        MRBM_SPECS,
+        GHADR_SPECS,
+        KHORRAMSHAHR_4_SPECS,
+        SEJJIL_2_SPECS,
+        HAJ_QASEM_SPECS,
+        FATTAH_1_SPECS,
+        MINUTEMAN_III_SPECS,
+        TRIDENT_II_SPECS,
+        M51_SPECS,
+        AGNI_V_SPECS,
+        HWASONG_18_SPECS,
+        DF_41_SPECS,
+        DF_17_SPECS,
+    ]
+}
+
 // --- Trait & Enum ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Reflect)]

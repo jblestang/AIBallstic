@@ -29,6 +29,9 @@ pub struct Sun;
 struct Earth;
 
 #[derive(Resource)]
+pub struct ActiveMissileSpecs(pub MissileSpecs);
+
+#[derive(Resource)]
 struct SimulationSettings {
     time_scale: f32,
     rotation_paused: bool,
@@ -40,9 +43,39 @@ struct SimulationSettings {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let registry = get_missile_registry();
+
+    if args.iter().any(|arg| arg == "--list" || arg == "-l") {
+        println!("\n🚀 AIBallistic Missile Registry");
+        println!("===============================");
+        for specs in &registry {
+            println!("- {}", specs.name);
+        }
+        println!("\nUsage: cargo run --release -- --missile \"<name>\"\n");
+        return;
+    }
+
+    let mut selected_specs = KHORRAMSHAHR_4_SPECS;
+    if let Some(pos) = args.iter().position(|arg| arg == "--missile" || arg == "-m") {
+        if let Some(target_name) = args.get(pos + 1) {
+            if let Some(specs) = registry.iter().find(|s| s.name.to_lowercase().contains(&target_name.to_lowercase())) {
+                selected_specs = *specs;
+                println!("✅ Selected missile: {}", selected_specs.name);
+            } else {
+                println!("❌ Missile '{}' not found. Available:", target_name);
+                for specs in &registry {
+                    println!("- {}", specs.name);
+                }
+                return;
+            }
+        }
+    }
+
     App::new()
         .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
         .add_plugins(EguiPlugin::default())
+        .insert_resource(ActiveMissileSpecs(selected_specs))
         .insert_resource(SimulationSettings { 
             time_scale: 10.0, 
             rotation_paused: false,
@@ -66,6 +99,7 @@ fn setup(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     asset_server: Res<AssetServer>,
+    active_specs: Res<ActiveMissileSpecs>,
 ) {
     // Earth (North Pole at +Y, Prime Meridian at +X)
     commands.spawn((
@@ -101,16 +135,17 @@ fn setup(
     // Launch from TEHRAN, IR
     // Geodetic: 35.6892° N, 51.3890° E
     let tehran_ecef = geodetic_to_ecef(35.6892, 51.3890, 10.0);
+    let specs = active_specs.0;
     
     commands.spawn(Missile {
         position_ecef: tehran_ecef,
         start_position_ecef: tehran_ecef,
         velocity_ecef: DVec3::ZERO,
-        mass: KHORRAMSHAHR_4_SPECS.dry_mass + KHORRAMSHAHR_4_SPECS.fuel_mass,
+        mass: specs.dry_mass + specs.fuel_mass,
         timer: 0.0,
         phase: FlightPhase::Boost,
         path: Vec::new(),
-        model: Box::new(BallisticMissilePhysics::new(KHORRAMSHAHR_4_SPECS)),
+        model: Box::new(BallisticMissilePhysics::new(specs)),
     });
 
     // Camera
@@ -338,10 +373,11 @@ fn input_system(
 fn egui_stats_system(
     mut commands: Commands,
     mut contexts: EguiContexts,
-    mut missile_query: Query<(Entity, &mut Missile)>,
+    missile_query: Query<(Entity, &Missile)>,
     time: Res<Time>,
     _window_query: Query<&Window, With<bevy::window::PrimaryWindow>>,
-    mut settings: ResMut<SimulationSettings>,
+    _settings: Res<SimulationSettings>,
+    active_specs: Res<ActiveMissileSpecs>,
 ) {
     // Avoid panics on first frames if egui isn't fully initialized with fonts
     if time.elapsed_secs() < 0.2 {
@@ -355,7 +391,7 @@ fn egui_stats_system(
             .show(ctx, |ui| {
                 ui.style_mut().spacing.button_padding = egui::vec2(10.0, 5.0);
                 
-                if let Some((_entity, mut missile)) = missile_query.iter_mut().next() {
+                if let Some((_entity, missile)) = missile_query.iter().next() {
                     let moscow_ecef = geodetic_to_ecef(MOSCOW_LAT, MOSCOW_LON, 0.0);
                     let dist_to_target = missile.position_ecef.distance(moscow_ecef) / 1000.0;
                     let dist_from_start = missile.position_ecef.distance(missile.start_position_ecef) / 1000.0;
@@ -377,33 +413,25 @@ fn egui_stats_system(
 
                 } else {
                     ui.label("No missile active.");
+                    if ui.button("Spawn Missile").clicked() {
+                        spawn_default_missile(&mut commands, &active_specs);
+                    }
                 }
             });
     }
 }
 
-fn reset_missile_in_place(missile: &mut Missile, specs: MissileSpecs) {
+fn spawn_default_missile(commands: &mut Commands, active_specs: &ActiveMissileSpecs) {
     let tehran_ecef = geodetic_to_ecef(35.6892, 51.3890, 10.0);
-    missile.position_ecef = tehran_ecef;
-    missile.start_position_ecef = tehran_ecef;
-    missile.velocity_ecef = DVec3::ZERO;
-    missile.mass = specs.dry_mass + specs.fuel_mass;
-    missile.timer = 0.0;
-    missile.phase = FlightPhase::Boost;
-    missile.path.clear();
-    missile.model = Box::new(BallisticMissilePhysics::new(specs));
-}
-
-fn spawn_default_missile(commands: &mut Commands) {
-    let tehran_ecef = geodetic_to_ecef(35.6892, 51.3890, 10.0);
+    let specs = active_specs.0;
     commands.spawn(Missile {
         position_ecef: tehran_ecef,
         start_position_ecef: tehran_ecef,
         velocity_ecef: DVec3::ZERO,
-        mass: KHORRAMSHAHR_4_SPECS.dry_mass + KHORRAMSHAHR_4_SPECS.fuel_mass,
+        mass: specs.dry_mass + specs.fuel_mass,
         timer: 0.0,
         phase: FlightPhase::Boost,
         path: Vec::new(),
-        model: Box::new(BallisticMissilePhysics::new(KHORRAMSHAHR_4_SPECS)),
+        model: Box::new(BallisticMissilePhysics::new(specs)),
     });
 }
