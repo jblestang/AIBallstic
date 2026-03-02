@@ -56,7 +56,7 @@ fn main() {
         return;
     }
 
-    let mut selected_specs = KHORRAMSHAHR_4_SPECS;
+    let mut selected_specs = registry.first().copied().expect("Missile registry is empty!");
     if let Some(pos) = args.iter().position(|arg| arg == "--missile" || arg == "-m") {
         if let Some(target_name) = args.get(pos + 1) {
             if let Some(specs) = registry.iter().find(|s| s.name.to_lowercase().contains(&target_name.to_lowercase())) {
