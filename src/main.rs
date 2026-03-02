@@ -1053,8 +1053,9 @@ fn egui_stats_system(
     mut contexts: EguiContexts,
     missile_query: Query<(Entity, &Missile)>,
     time: Res<Time>,
-    _window_query: Query<&Window, With<bevy::window::PrimaryWindow>>,
-    _settings: Res<SimulationSettings>,
+    window_query: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    camera_query: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
+    settings: Res<SimulationSettings>,
     active_specs: Res<ActiveMissileSpecs>,
 ) {
     // Avoid panics on first frames if egui isn't
@@ -1097,6 +1098,61 @@ fn egui_stats_system(
                     }
                 }
             });
+
+        // Mouse Cursor Raycast Tooltip
+        let mut cursor_geo_text = "Cursor: Off Earth".to_string();
+        
+        if let Some(window) = window_query.iter().next() {
+            if let Some(cursor_pos) = window.cursor_position() {
+                if let Some((camera, camera_transform)) = camera_query.iter().next() {
+                    if let Ok(ray) = camera.viewport_to_world(camera_transform, cursor_pos) {
+                        let origin = ray.origin;
+                        let dir = *ray.direction;
+                        
+                        let a: f32 = dir.length_squared();
+                        let b: f32 = 2.0 * origin.dot(dir);
+                        let c: f32 = origin.length_squared() - (EARTH_RADIUS * EARTH_RADIUS) as f32;
+                        
+                        let discriminant: f32 = b * b - 4.0 * a * c;
+                        if discriminant >= 0.0 {
+                            let t = (-b - discriminant.sqrt()) / (2.0 * a);
+                            if t > 0.0 {
+                                let hit_point = origin + dir * t;
+                                
+                                // Adjust for texture offset to get visual lat/lon
+                                let ecef_pos = DVec3::new(hit_point.x as f64, hit_point.y as f64, hit_point.z as f64);
+                                
+                                // The visual texture is rotated by texture_lon_offset
+                                let offset_rad = (-settings.texture_lon_offset).to_radians() as f64; 
+                                let rotated_x = ecef_pos.x * offset_rad.cos() - ecef_pos.z * offset_rad.sin();
+                                let rotated_z = ecef_pos.x * offset_rad.sin() + ecef_pos.z * offset_rad.cos();
+                                
+                                // Standard ECEF to Lat/Lon
+                                let r = ecef_pos.length();
+                                let lat = (ecef_pos.y / r).asin().to_degrees();
+                                let lon = rotated_z.atan2(rotated_x).to_degrees();
+                                
+                                let lat_str = if lat >= 0.0 { format!("{:.4}° N", lat) } else { format!("{:.4}° S", -lat) };
+                                let lon_str = if lon >= 0.0 { format!("{:.4}° E", lon) } else { format!("{:.4}° W", -lon) };
+                                
+                                cursor_geo_text = format!("{}, {}", lat_str, lon_str);
+                            }
+                        }
+                    }
+                }
+                
+                if cursor_geo_text != "Cursor: Off Earth" {
+                    egui::Area::new(egui::Id::new("cursor_tooltip"))
+                        .fixed_pos(egui::pos2(cursor_pos.x + 15.0, cursor_pos.y + 15.0))
+                        .order(egui::Order::Tooltip)
+                        .show(ctx, |ui| {
+                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.label(cursor_geo_text);
+                            });
+                        });
+                }
+            }
+        }
     }
 }
 
