@@ -35,6 +35,8 @@ struct SimulationSettings {
     zoom_distance: f32,
     theta: f32, // Horizontal angle
     phi: f32,   // Vertical angle
+    coriolis_enabled: bool,
+    centrifugal_enabled: bool,
 }
 
 fn main() {
@@ -47,9 +49,15 @@ fn main() {
             zoom_distance: EARTH_RADIUS as f32 * 2.5,
             theta: 0.0,
             phi: 0.5, // Slight tilt
+            coriolis_enabled: true,
+            centrifugal_enabled: true,
         })
         .add_systems(Startup, setup)
-        .add_systems(Update, (physics_system, trajectory_system, camera_system, input_system, egui_stats_system, solar_lighting_system))
+        .add_systems(Update, (
+            egui_stats_system,
+            (physics_system, trajectory_system, camera_system, input_system, solar_lighting_system)
+                .after(egui_stats_system),
+        ))
         .run();
 }
 
@@ -86,8 +94,8 @@ fn setup(
             shadows_enabled: true,
             ..default()
         },
-        Sun,
-        Transform::from_xyz(4.0 * EARTH_RADIUS as f32, 0.0, 0.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(4.0 * EARTH_RADIUS as f32, 0.0, 2.0 * EARTH_RADIUS as f32).looking_at(Vec3::ZERO, Vec3::Y),
+        Sun
     ));
 
     // Launch from TEHRAN, IR
@@ -98,11 +106,11 @@ fn setup(
         position_ecef: tehran_ecef,
         start_position_ecef: tehran_ecef,
         velocity_ecef: DVec3::ZERO,
-        mass: GHADR_SPECS.dry_mass + GHADR_SPECS.fuel_mass,
+        mass: KHORRAMSHAHR_4_SPECS.dry_mass + KHORRAMSHAHR_4_SPECS.fuel_mass,
         timer: 0.0,
         phase: FlightPhase::Boost,
         path: Vec::new(),
-        model: Box::new(BallisticMissilePhysics::new(GHADR_SPECS)),
+        model: Box::new(BallisticMissilePhysics::new(KHORRAMSHAHR_4_SPECS)),
     });
 
     // Camera
@@ -136,8 +144,18 @@ fn physics_system(
 
         let v_ecef = missile.velocity_ecef;
         let r_ecef = missile.position_ecef;
-        let coriolis_accel = -2.0 * EARTH_OMEGA.cross(v_ecef);
-        let centrifugal_accel = -EARTH_OMEGA.cross(EARTH_OMEGA.cross(r_ecef));
+        
+        let coriolis_accel = if settings.coriolis_enabled {
+            -2.0 * EARTH_OMEGA.cross(v_ecef)
+        } else {
+            DVec3::ZERO
+        };
+        
+        let centrifugal_accel = if settings.centrifugal_enabled {
+            -EARTH_OMEGA.cross(EARTH_OMEGA.cross(r_ecef))
+        } else {
+            DVec3::ZERO
+        };
 
         // Pluggable Model Specific Acceleration (Thrust, Drag, Guidance, etc.)
         let (model_accel, new_phase, mass_delta) = missile.model.compute_acceleration(
@@ -201,7 +219,15 @@ fn camera_system(
     mut query: Query<&mut Transform, With<Camera3d>>,
     time: Res<Time>,
     settings: Res<SimulationSettings>,
+    mut contexts: EguiContexts,
 ) {
+    // If egui is being interacted with, don't move camera
+    if let Ok(ctx) = contexts.ctx_mut() {
+        if ctx.is_pointer_over_area() || ctx.wants_pointer_input() || ctx.is_using_pointer() {
+            return;
+        }
+    }
+
     let mut settings_rotation = settings.theta;
     if !settings.rotation_paused {
         settings_rotation += 0.1 * time.delta_secs();
@@ -265,7 +291,14 @@ fn input_system(
     mut settings: ResMut<SimulationSettings>,
     mut scroll_evr: MessageReader<bevy::input::mouse::MouseWheel>,
     time: Res<Time>,
+    mut contexts: EguiContexts,
 ) {
+    if let Ok(ctx) = contexts.ctx_mut() {
+        if ctx.is_pointer_over_area() || ctx.wants_pointer_input() || ctx.is_using_pointer() {
+            return;
+        }
+    }
+
     if keys.just_pressed(KeyCode::Space) {
         settings.rotation_paused = !settings.rotation_paused;
     }
@@ -303,21 +336,26 @@ fn input_system(
 }
 
 fn egui_stats_system(
+    mut commands: Commands,
     mut contexts: EguiContexts,
-    missile_query: Query<&Missile>,
+    mut missile_query: Query<(Entity, &mut Missile)>,
     time: Res<Time>,
+    _window_query: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    mut settings: ResMut<SimulationSettings>,
 ) {
     // Avoid panics on first frames if egui isn't fully initialized with fonts
     if time.elapsed_secs() < 0.2 {
         return;
     }
-
     if let Ok(ctx) = contexts.ctx_mut() {
-        egui::Window::new("Missile Statistics")
-            .default_open(true)
-            .anchor(egui::Align2::LEFT_TOP, [10.0, 10.0])
+        egui::Window::new("AIBallistic Command Center 🚀")
+            .fixed_pos([10.0, 10.0])
+            .default_width(320.0)
+            .interactable(true)
             .show(ctx, |ui| {
-                if let Some(missile) = missile_query.iter().next() {
+                ui.style_mut().spacing.button_padding = egui::vec2(10.0, 5.0);
+                
+                if let Some((_entity, mut missile)) = missile_query.iter_mut().next() {
                     let moscow_ecef = geodetic_to_ecef(MOSCOW_LAT, MOSCOW_LON, 0.0);
                     let dist_to_target = missile.position_ecef.distance(moscow_ecef) / 1000.0;
                     let dist_from_start = missile.position_ecef.distance(missile.start_position_ecef) / 1000.0;
@@ -333,19 +371,39 @@ fn egui_stats_system(
                         }
 
                         ui.separator();
-                        ui.label(format!("Dist from Start: {:.1} km", dist_from_start));
-                        ui.label(format!("Dist to Target: {:.1} km", dist_to_target));
-                        
-                        ui.separator();
-                        let now = Utc::now();
-                        ui.label(format!("UTC Time: {:02}:{:02}:{:02}", now.hour(), now.minute(), now.second()));
-                        let utc_h = now.hour() as f64 + now.minute() as f64 / 60.0;
-                        let sun_lon = (12.0 - utc_h) * 15.0;
-                        ui.label(format!("Subsolar Lon: {:.1}° {}", sun_lon.abs(), if sun_lon >= 0.0 { "E" } else { "W" }));
+                        ui.label(format!("Distance from Start: {:.1} km", dist_from_start));
+                        ui.label(format!("Distance to Target: {:.1} km", dist_to_target));
                     });
+
                 } else {
                     ui.label("No missile active.");
                 }
             });
     }
+}
+
+fn reset_missile_in_place(missile: &mut Missile, specs: MissileSpecs) {
+    let tehran_ecef = geodetic_to_ecef(35.6892, 51.3890, 10.0);
+    missile.position_ecef = tehran_ecef;
+    missile.start_position_ecef = tehran_ecef;
+    missile.velocity_ecef = DVec3::ZERO;
+    missile.mass = specs.dry_mass + specs.fuel_mass;
+    missile.timer = 0.0;
+    missile.phase = FlightPhase::Boost;
+    missile.path.clear();
+    missile.model = Box::new(BallisticMissilePhysics::new(specs));
+}
+
+fn spawn_default_missile(commands: &mut Commands) {
+    let tehran_ecef = geodetic_to_ecef(35.6892, 51.3890, 10.0);
+    commands.spawn(Missile {
+        position_ecef: tehran_ecef,
+        start_position_ecef: tehran_ecef,
+        velocity_ecef: DVec3::ZERO,
+        mass: KHORRAMSHAHR_4_SPECS.dry_mass + KHORRAMSHAHR_4_SPECS.fuel_mass,
+        timer: 0.0,
+        phase: FlightPhase::Boost,
+        path: Vec::new(),
+        model: Box::new(BallisticMissilePhysics::new(KHORRAMSHAHR_4_SPECS)),
+    });
 }

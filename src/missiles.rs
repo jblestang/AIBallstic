@@ -83,6 +83,153 @@ pub const GHADR_SPECS: MissileSpecs = MissileSpecs {
     boost_loft_factor: 1.15,
 };
 
+// Recent Iranian Models
+
+pub const KHORRAMSHAHR_4_SPECS: MissileSpecs = MissileSpecs {
+    name: "Khorramshahr-4 (Kheibar)",
+    dry_mass: 3500.0, // Solid heavy structure for 1.5t warhead
+    fuel_mass: 25000.0, 
+    burn_time: 145.0, // Liquid fueled sustainer
+    area: 1.77, // 1.5m diameter
+    isp_sea_level: 265.0,
+    isp_vacuum: 310.0,
+    pitch_start_time: 15.0,
+    pitch_turn_rate: 0.8,
+    boost_loft_factor: 1.2,
+};
+
+pub const SEJJIL_2_SPECS: MissileSpecs = MissileSpecs {
+    name: "Sejjil-2",
+    dry_mass: 2500.0,
+    fuel_mass: 20100.0,
+    burn_time: 115.0, // Two-stage solid, simplified to single boost
+    area: 1.23, // 1.25m diameter
+    isp_sea_level: 245.0,
+    isp_vacuum: 290.0,
+    pitch_start_time: 10.0,
+    pitch_turn_rate: 0.7,
+    boost_loft_factor: 1.1,
+};
+
+pub const HAJ_QASEM_SPECS: MissileSpecs = MissileSpecs {
+    name: "Haj Qasem",
+    dry_mass: 1000.0,
+    fuel_mass: 5500.0,
+    burn_time: 85.0,
+    area: 0.5, 
+    isp_sea_level: 240.0,
+    isp_vacuum: 285.0,
+    pitch_start_time: 8.0,
+    pitch_turn_rate: 0.6,
+    boost_loft_factor: 1.05,
+};
+
+pub const FATTAH_1_SPECS: MissileSpecs = MissileSpecs {
+    name: "Fattah-1 (Boost Phase)",
+    dry_mass: 2500.0,
+    fuel_mass: 9000.0,
+    burn_time: 105.0,
+    area: 0.8,
+    isp_sea_level: 250.0,
+    isp_vacuum: 300.0,
+    pitch_start_time: 12.0,
+    pitch_turn_rate: 0.75,
+    boost_loft_factor: 1.1,
+};
+
+// Global Models (US, France, India, North Korea)
+
+pub const MINUTEMAN_III_SPECS: MissileSpecs = MissileSpecs {
+    name: "LGM-30G Minuteman III (USA)",
+    dry_mass: 3500.0,
+    fuel_mass: 32000.0,
+    burn_time: 180.0,
+    area: 2.2, 
+    isp_sea_level: 282.0,
+    isp_vacuum: 305.0,
+    pitch_start_time: 10.0,
+    pitch_turn_rate: 0.85,
+    boost_loft_factor: 1.25,
+};
+
+pub const TRIDENT_II_SPECS: MissileSpecs = MissileSpecs {
+    name: "UGM-133 Trident II (USA/UK)",
+    dry_mass: 5000.0,
+    fuel_mass: 54000.0,
+    burn_time: 160.0,
+    area: 3.5,
+    isp_sea_level: 280.0,
+    isp_vacuum: 300.0,
+    pitch_start_time: 8.0,
+    pitch_turn_rate: 0.9,
+    boost_loft_factor: 1.3,
+};
+
+pub const M51_SPECS: MissileSpecs = MissileSpecs {
+    name: "M51 SLBM (France)",
+    dry_mass: 4500.0,
+    fuel_mass: 47500.0,
+    burn_time: 170.0,
+    area: 4.1,
+    isp_sea_level: 280.0,
+    isp_vacuum: 300.0,
+    pitch_start_time: 10.0,
+    pitch_turn_rate: 0.85,
+    boost_loft_factor: 1.2,
+};
+
+pub const AGNI_V_SPECS: MissileSpecs = MissileSpecs {
+    name: "Agni-V (India)",
+    dry_mass: 5000.0,
+    fuel_mass: 45000.0,
+    burn_time: 190.0,
+    area: 3.1,
+    isp_sea_level: 275.0,
+    isp_vacuum: 300.0,
+    pitch_start_time: 15.0,
+    pitch_turn_rate: 0.8,
+    boost_loft_factor: 1.15,
+};
+
+pub const HWASONG_18_SPECS: MissileSpecs = MissileSpecs {
+    name: "Hwasong-18 (North Korea)",
+    dry_mass: 6000.0,
+    fuel_mass: 50000.0,
+    burn_time: 210.0,
+    area: 3.5,
+    isp_sea_level: 275.0,
+    isp_vacuum: 305.0,
+    pitch_start_time: 12.0,
+    pitch_turn_rate: 0.75,
+    boost_loft_factor: 1.1,
+};
+
+pub const DF_41_SPECS: MissileSpecs = MissileSpecs {
+    name: "DF-41 (China)",
+    dry_mass: 8000.0,
+    fuel_mass: 72000.0,
+    burn_time: 200.0,
+    area: 3.14, // 2.0m diameter
+    isp_sea_level: 285.0,
+    isp_vacuum: 315.0,
+    pitch_start_time: 15.0,
+    pitch_turn_rate: 0.85,
+    boost_loft_factor: 1.25,
+};
+
+pub const DF_17_SPECS: MissileSpecs = MissileSpecs {
+    name: "DF-17 (China)",
+    dry_mass: 4000.0,
+    fuel_mass: 11000.0,
+    burn_time: 110.0,
+    area: 0.78, 
+    isp_sea_level: 260.0,
+    isp_vacuum: 300.0,
+    pitch_start_time: 10.0,
+    pitch_turn_rate: 0.8,
+    boost_loft_factor: 1.1,
+};
+
 // --- Trait & Enum ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Reflect)]
