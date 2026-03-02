@@ -173,26 +173,37 @@ fn physics_system(
              continue;
         }
 
-        // Global acceleration terms (Gravitational + Fictitious)
+        // --- 1. Global Field Accelerations ---
+        // Gravity Equation: a = - (G * M) / r^2 * (r_hat)
+        // [Reference: https://en.wikipedia.org/wiki/Newton%27s_law_of_universal_gravitation]
         let gravity_dir = -missile.position_ecef.normalize();
         let gravity_accel = gravity_dir * (GRAVITY_CONSTANT / (r * r));
 
         let v_ecef = missile.velocity_ecef;
         let r_ecef = missile.position_ecef;
         
+        // Coriolis Effect: Apparent deflection due to rotating reference frame.
+        // Equation: a_coriolis = -2 * (Omega x v)
+        // [Reference: https://en.wikipedia.org/wiki/Coriolis_force]
         let coriolis_accel = if settings.coriolis_enabled {
             -2.0 * EARTH_OMEGA.cross(v_ecef)
         } else {
             DVec3::ZERO
         };
         
+        // Centrifugal Force: Outward apparent force in a rotating reference frame.
+        // Equation: a_centrifugal = - Omega x (Omega x r)
+        // Causes the Earth's equatorial bulge and reduces apparent gravity at the equator.
+        // [Reference: https://en.wikipedia.org/wiki/Centrifugal_force]
         let centrifugal_accel = if settings.centrifugal_enabled {
             -EARTH_OMEGA.cross(EARTH_OMEGA.cross(r_ecef))
         } else {
             DVec3::ZERO
         };
 
-        // Pluggable Model Specific Acceleration (Thrust, Drag, Guidance, etc.)
+        // --- 2. Missile-Specific Accelerations ---
+        // Pluggable Model Specific Acceleration (Thrust, Aerodynamic Drag, etc.)
+        // These are calculated in the local frame of the missile based on its state.
         let (model_accel, new_phase, mass_delta) = missile.model.compute_acceleration(
             missile.position_ecef, 
             missile.velocity_ecef, 
@@ -205,13 +216,22 @@ fn physics_system(
         missile.mass += mass_delta;
         missile.timer += dt;
 
-        // Integration
+        // --- 3. Numerical Integration ---
+        // Using Semi-Implicit Euler integration for trajectory propagation.
+        // This is a symplectic integrator, meaning it better preserves energy 
+        // over time in orbital/ballistic mechanics compared to explicit Euler.
+        // [Reference: https://en.wikipedia.org/wiki/Semi-implicit_Euler_method]
         let total_accel = gravity_accel + coriolis_accel + centrifugal_accel + model_accel;
+        
+        // v_{n+1} = v_n + a_n * dt
         missile.velocity_ecef += total_accel * dt as f64;
         let vel = missile.velocity_ecef;
+        
+        // x_{n+1} = x_n + v_{n+1} * dt
         missile.position_ecef += vel * dt as f64;
         
-        // Track path
+        // --- 4. Trajectory Tracking ---
+        // Sample points for the 3D drawing system.
         if missile.timer % 1.0 < dt { 
             let pos = missile.position_ecef;
             let phase = missile.phase;
