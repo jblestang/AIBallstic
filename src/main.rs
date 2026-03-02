@@ -235,8 +235,14 @@ fn trajectory_system(
 
     for missile in query.iter() {
         let pos = missile.position_ecef.as_vec3();
+        let head_color = match missile.phase {
+            FlightPhase::Boost => bevy::color::palettes::css::YELLOW,
+            FlightPhase::Ballistic => bevy::color::palettes::css::AQUA,
+            FlightPhase::ReEntry => bevy::color::palettes::css::RED,
+            FlightPhase::Landed => bevy::color::palettes::css::GREEN,
+        };
         // Bevy 0.17 gizmos.sphere(position, radius, color)
-        gizmos.sphere(pos, 50000.0, bevy::color::palettes::basic::RED);
+        gizmos.sphere(pos, 50000.0, head_color);
         
         // Draw full path with phase-based colors
         if missile.path.len() > 1 {

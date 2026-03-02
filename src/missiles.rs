@@ -1,7 +1,9 @@
 use bevy::prelude::*;
 use glam::DVec3;
+use serde::{Deserialize, Serialize};
 use crate::*;
 
+// --- Core Structs ---
 // --- Physical Constants (ISA & Earth) ---
 pub const EARTH_RADIUS: f64 = 6_371_000.0;
 pub const R_AIR: f64 = 287.05;
@@ -20,9 +22,10 @@ pub const EARTH_OMEGA: DVec3 = DVec3::new(0.0, 7.2921159e-5, 0.0); // Rad/s arou
 pub const MOSCOW_LAT: f64 = 55.7558;
 pub const MOSCOW_LON: f64 = 37.6173;
 
+// --- Core Structs ---
 // --- Missile Specification Structure ---
 
-#[derive(Debug, Clone, Copy, Reflect)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct MissileSpecs {
     pub name: &'static str,
     pub dry_mass: f64,
@@ -231,6 +234,17 @@ pub const DF_17_SPECS: MissileSpecs = MissileSpecs {
 };
 
 pub fn get_missile_registry() -> Vec<MissileSpecs> {
+    if let Ok(json_str) = std::fs::read_to_string("assets/missiles.json") {
+        let static_str: &'static str = Box::leak(json_str.into_boxed_str());
+        if let Ok(registry) = serde_json::from_str(static_str) {
+            return registry;
+        } else {
+            println!("⚠️ Failed to parse assets/missiles.json, falling back to internal registry.");
+        }
+    } else {
+        println!("⚠️ Could not read assets/missiles.json, falling back to internal registry.");
+    }
+
     vec![
         SCUD_C_SPECS,
         MRBM_SPECS,
@@ -307,7 +321,7 @@ impl PhysicsModel for BallisticMissilePhysics {
 
         let phase = if timer < self.specs.burn_time {
             FlightPhase::Boost
-        } else if altitude > 100000.0 || velocity.dot(position) >= 0.0 {
+        } else if altitude > 120000.0 || velocity.dot(position) >= 0.0 {
             FlightPhase::Ballistic
         } else {
             FlightPhase::ReEntry
