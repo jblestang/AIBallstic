@@ -1130,7 +1130,7 @@ fn egui_stats_system(
                                 // Standard ECEF to Lat/Lon
                                 let r = ecef_pos.length();
                                 let lat = (ecef_pos.y / r).asin().to_degrees();
-                                let lon = rotated_z.atan2(rotated_x).to_degrees();
+                                let lon = -rotated_z.atan2(rotated_x).to_degrees();
                                 
                                 let lat_str = if lat >= 0.0 { format!("{:.4}° N", lat) } else { format!("{:.4}° S", -lat) };
                                 let lon_str = if lon >= 0.0 { format!("{:.4}° E", lon) } else { format!("{:.4}° W", -lon) };
