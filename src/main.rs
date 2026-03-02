@@ -755,6 +755,29 @@ fn trajectory_system(
     prediction: Res<ImpactPrediction>,
     settings: Res<SimulationSettings>,
 ) {
+    // Draw Meridians (Longitude lines every 15 degrees)
+    for lon in (0..360).step_by(15) {
+        let lon_rad = (lon as f32).to_radians();
+        let normal = Vec3::new(lon_rad.sin(), 0.0, -lon_rad.cos());
+        gizmos.circle(
+            Isometry3d::new(Vec3::ZERO, Quat::from_rotation_arc(Vec3::Z, normal)),
+            EARTH_RADIUS as f32 * 1.002, // Slightly above surface
+            bevy::color::Color::srgba(1.0, 1.0, 1.0, 0.4),
+        );
+    }
+    
+    // Draw Parallels (Latitude lines every 15 degrees)
+    for lat in (-75..=75).step_by(15) {
+        let lat_rad = (lat as f32).to_radians();
+        let center_y = EARTH_RADIUS as f32 * lat_rad.sin();
+        let radius = EARTH_RADIUS as f32 * lat_rad.cos();
+        gizmos.circle(
+            Isometry3d::new(Vec3::new(0.0, center_y, 0.0), Quat::from_rotation_arc(Vec3::Z, Vec3::Y)),
+            radius * 1.002,
+            bevy::color::Color::srgba(1.0, 1.0, 1.0, 0.4),
+        );
+    }
+
     // Target Markers
     // Tehran - RED
     let tehran = geodetic_to_ecef(35.6892, 51.3890, 0.0).as_vec3();
