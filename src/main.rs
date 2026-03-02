@@ -66,6 +66,37 @@ struct RadarStation {
     pub scan_timer: f32,
 }
 
+// ABM Interception Structures
+#[derive(Component)]
+struct DefendedZone {
+    pub position_ecef: DVec3,
+    pub radius: f64, // e.g., 500km Defense Radius
+}
+
+#[derive(Component)]
+struct ABMInterceptor {
+    pub target_entity: Entity,
+    pub position_ecef: DVec3,
+    pub velocity_ecef: DVec3,
+    pub navigation_gain: f64, // PN gain typically 3.0 to 5.0
+    pub max_g_load: f64, // Maximum lateral acceleration
+    pub kill_radius: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SpawnABMEvent {
+    pub target_entity: Entity,
+    pub battery_pos: DVec3,
+}
+
+#[derive(Resource, Default)]
+struct ABMLaunchQueue(Vec<SpawnABMEvent>);
+#[derive(Component)]
+struct Explosion {
+    pub timer: f32,
+    pub max_time: f32,
+}
+
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -113,11 +144,17 @@ fn main() {
         })
         .init_resource::<TrackedMissileState>()
         .init_resource::<ImpactPrediction>()
+        .init_resource::<ABMLaunchQueue>()
         .add_systems(Startup, setup)
         .add_systems(Update, (
             egui_stats_system,
-            (physics_system, trajectory_system, camera_system, input_system, solar_lighting_system, radar_scan_system, impact_prediction_system)
-                .after(egui_stats_system),
+            (
+                physics_system, trajectory_system, camera_system, input_system, 
+                solar_lighting_system, radar_scan_system, impact_prediction_system
+            ).after(egui_stats_system),
+            (
+                abm_c2_system, spawn_abm_system, abm_guidance_system, abm_kill_system, explosion_system
+            ).after(egui_stats_system),
         ))
         .run();
 }
@@ -167,6 +204,12 @@ fn setup(
         position_ecef: geodetic_to_ecef(44.07, 24.31, 100.0),
         range: 5_000_000.0, // 5000 km
         scan_timer: 0.0,
+    });
+
+    // Defended Zone (Moscow)
+    commands.spawn(DefendedZone {
+        position_ecef: geodetic_to_ecef(55.7558, 37.6173, 0.0),
+        radius: 300_000.0, // 300 km point-defense radius
     });
 
     // Launch from TEHRAN, IR
@@ -502,6 +545,195 @@ fn impact_prediction_system(
         }
         
         prediction.coordinates_ecef.push(pos);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// ABM Systems
+// ----------------------------------------------------------------------------
+
+fn abm_c2_system(
+    mut launch_queue: ResMut<ABMLaunchQueue>,
+    prediction: Res<ImpactPrediction>,
+    defended_zones: Query<&DefendedZone>,
+    missile_query: Query<(Entity, &Missile)>,
+    interceptor_query: Query<&ABMInterceptor>,
+) {
+    if prediction.coordinates_ecef.is_empty() { return; }
+    
+    // Determine the centroid of the swarm
+    let mut centroid = DVec3::ZERO;
+    for &pt in &prediction.coordinates_ecef {
+        centroid += pt;
+    }
+    centroid /= prediction.coordinates_ecef.len() as f64;
+    
+    for zone in defended_zones.iter() {
+        if centroid.distance(zone.position_ecef) <= zone.radius {
+            // Threat calculated to land within defended zone!
+            
+            for (missile_entity, missile) in missile_query.iter() {
+                if missile.phase == FlightPhase::Landed { continue; }
+                
+                // Do not launch if there is already an active interceptor
+                let mut already_targeted = false;
+                for int in interceptor_query.iter() {
+                    if int.target_entity == missile_entity { already_targeted = true; break; }
+                }
+                if already_targeted { continue; }
+                
+                // Only launch if the target is within 500km of the defended zone
+                let dist_to_zone = missile.position_ecef.distance(zone.position_ecef);
+                if dist_to_zone < 500_000.0 {
+                    let battery_pos = zone.position_ecef + (zone.position_ecef.normalize() * 100.0); // Surface launch
+                    launch_queue.0.push(SpawnABMEvent {
+                        target_entity: missile_entity,
+                        battery_pos,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn spawn_abm_system(
+    mut commands: Commands,
+    mut launch_queue: ResMut<ABMLaunchQueue>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    for event in launch_queue.0.drain(..) {
+        println!("🚀 BATTERY LAUNCH: ABM Interceptor fired to destroy target {:?}", event.target_entity);
+        
+        commands.spawn((
+            Mesh3d(meshes.add(Sphere::new(50000.0).mesh().uv(32, 16))), 
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: bevy::color::Color::srgb(0.0, 1.0, 0.0), // Green for Interceptors
+                unlit: true,
+                ..default()
+            })),
+            Transform::from_translation(event.battery_pos.as_vec3()),
+            ABMInterceptor {
+                target_entity: event.target_entity,
+                position_ecef: event.battery_pos,
+                velocity_ecef: event.battery_pos.normalize() * 500.0, // Booster fast launch speed
+                navigation_gain: 4.0, 
+                max_g_load: 50.0 * 9.81, 
+                kill_radius: 50_000.0, 
+            }
+        ));
+    }
+}
+
+fn abm_guidance_system(
+    time: Res<Time>,
+    settings: Res<SimulationSettings>,
+    mut commands: Commands,
+    mut interceptor_query: Query<(Entity, &mut ABMInterceptor, &mut Transform)>,
+    missile_query: Query<(Entity, &Missile)>,
+    tracked_state: Res<TrackedMissileState>,
+) {
+    let dt = time.delta_secs() * settings.time_scale;
+    
+    for (int_ent, mut abm, mut transform) in interceptor_query.iter_mut() {
+        let target_opt = missile_query.iter().find(|(e, _)| *e == abm.target_entity);
+        if let Some((_, target_missile)) = target_opt {
+            
+            if target_missile.phase == FlightPhase::Landed {
+                commands.entity(int_ent).despawn();
+                continue;
+            }
+            
+            // Proportional Navigation
+            let target_pos = tracked_state.position_ecef.unwrap_or(target_missile.position_ecef);
+            let target_vel = tracked_state.velocity_ecef.unwrap_or(target_missile.velocity_ecef);
+            
+            let los = target_pos - abm.position_ecef;
+            let los_dist = los.length();
+            if los_dist < 1.0 { continue; } 
+            let los_dir = los.normalize();
+            
+            let rel_vel = target_vel - abm.velocity_ecef;
+            let closing_vel = -rel_vel.dot(los_dir);
+            
+            let los_rate_vector = los_dir.cross(rel_vel) / los_dist;
+            
+            let mut accel = DVec3::ZERO;
+            if closing_vel > 0.0 {
+                accel = abm.navigation_gain * closing_vel * los_rate_vector.cross(los_dir);
+                if accel.length() > abm.max_g_load {
+                    accel = accel.normalize() * abm.max_g_load;
+                }
+            }
+            
+            // Gravity
+            let r = abm.position_ecef.length();
+            let gravity = -abm.position_ecef.normalize() * (GRAVITY_CONSTANT / (r * r));
+            accel += gravity;
+            
+            // Thrust
+            let speed = abm.velocity_ecef.length();
+            if speed < 5000.0 {
+                let thrust_dir = if speed > 1.0 { abm.velocity_ecef.normalize() } else { los_dir };
+                accel += thrust_dir * (30.0 * 9.81); 
+            }
+            
+            abm.velocity_ecef += accel * dt as f64;
+            let delta = abm.velocity_ecef * dt as f64;
+            abm.position_ecef += delta;
+            transform.translation = abm.position_ecef.as_vec3();
+            
+        } else {
+            commands.entity(int_ent).despawn();
+        }
+    }
+}
+
+fn abm_kill_system(
+    mut commands: Commands,
+    interceptor_query: Query<(Entity, &ABMInterceptor)>,
+    missile_query: Query<(Entity, &Missile)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    for (int_ent, abm) in interceptor_query.iter() {
+        if let Ok((missile_ent, missile)) = missile_query.get(abm.target_entity) {
+            let dist = abm.position_ecef.distance(missile.position_ecef);
+            if dist < abm.kill_radius {
+                let alt = (missile.position_ecef.length() - EARTH_RADIUS) / 1000.0;
+                println!("💥 INTERCEPT SUCCESSFUL! Threat neutralized at {:.1} km altitude.", alt);
+                
+                commands.spawn((
+                    Mesh3d(meshes.add(Sphere::new(100_000.0).mesh().uv(32, 16))), 
+                    MeshMaterial3d(materials.add(StandardMaterial {
+                        base_color: bevy::color::Color::srgb(1.0, 0.5, 0.0), // Orange fireball
+                        unlit: true,
+                        ..default()
+                    })),
+                    Transform::from_translation(abm.position_ecef.as_vec3()),
+                    Explosion { timer: 0.0, max_time: 2.0 }
+                ));
+                
+                commands.entity(missile_ent).despawn();
+                commands.entity(int_ent).despawn();
+            }
+        }
+    }
+}
+
+fn explosion_system(
+    time: Res<Time>,
+    mut commands: Commands,
+    mut q: Query<(Entity, &mut Explosion, &mut Transform)>,
+) {
+    for (e, mut exp, mut transform) in q.iter_mut() {
+        exp.timer += time.delta_secs();
+        if exp.timer >= exp.max_time {
+            commands.entity(e).despawn();
+        } else {
+            let scale = 1.0 - (exp.timer / exp.max_time);
+            transform.scale = Vec3::splat(scale.max(0.01));
+        }
     }
 }
 
