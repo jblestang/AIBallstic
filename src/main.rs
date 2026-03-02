@@ -745,6 +745,8 @@ fn trajectory_system(
     mut gizmos: Gizmos,
     query: Query<&Missile>,
     radar_query: Query<&RadarStation>,
+    defended_zones: Query<&DefendedZone>,
+    interceptor_query: Query<&ABMInterceptor>,
     prediction: Res<ImpactPrediction>,
     settings: Res<SimulationSettings>,
 ) {
@@ -759,6 +761,28 @@ fn trajectory_system(
             // Draw radar station
             gizmos.sphere(radar.position_ecef.as_vec3(), 75000.0, bevy::color::palettes::css::BLUE);
         }
+    }
+
+    // Defended Zones
+    for zone in defended_zones.iter() {
+        let p_vec = zone.position_ecef.as_vec3();
+        let up = p_vec.normalize();
+        
+        // Draw the zone origin point
+        gizmos.sphere(p_vec, 30_000.0, bevy::color::palettes::css::GREEN);
+        
+        // Draw the protective radius
+        gizmos.circle(
+            Isometry3d::new(p_vec, Quat::from_rotation_arc(Vec3::Z, up)),
+            zone.radius as f32,
+            bevy::color::palettes::css::LIMEGREEN,
+        );
+    }
+
+    // Active Interceptors
+    for abm in interceptor_query.iter() {
+        // Draw the interceptor tracking marker
+        gizmos.sphere(abm.position_ecef.as_vec3(), 40_000.0, bevy::color::palettes::css::LIME);
     }
 
     // Impact Prediction (CEP Scatter Visualization)
