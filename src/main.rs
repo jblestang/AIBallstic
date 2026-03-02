@@ -18,7 +18,7 @@ pub struct Missile {
     pub mass: f64,
     pub timer: f32,
     pub phase: FlightPhase,
-    pub path: Vec<Vec3>,
+    pub path: Vec<(Vec3, FlightPhase)>,
     pub model: Box<dyn PhysicsModel>,
 }
 
@@ -214,7 +214,8 @@ fn physics_system(
         // Track path
         if missile.timer % 1.0 < dt { 
             let pos = missile.position_ecef;
-            missile.path.push(pos.as_vec3());
+            let phase = missile.phase;
+            missile.path.push((pos.as_vec3(), phase));
         }
     }
 }
@@ -237,14 +238,30 @@ fn trajectory_system(
         // Bevy 0.17 gizmos.sphere(position, radius, color)
         gizmos.sphere(pos, 50000.0, bevy::color::palettes::basic::RED);
         
-        // Draw full path
+        // Draw full path with phase-based colors
         if missile.path.len() > 1 {
             for i in 0..missile.path.len()-1 {
-                gizmos.line(missile.path[i], missile.path[i+1], bevy::color::palettes::css::ORANGE);
+                let (p1, phase1) = missile.path[i];
+                let (p2, _phase2) = missile.path[i+1];
+                
+                let color = match phase1 {
+                    FlightPhase::Boost => bevy::color::palettes::css::YELLOW,
+                    FlightPhase::Ballistic => bevy::color::palettes::css::AQUA,
+                    FlightPhase::ReEntry => bevy::color::palettes::css::RED,
+                    FlightPhase::Landed => bevy::color::palettes::css::GREEN,
+                };
+                
+                gizmos.line(p1, p2, color);
             }
             // Line to current position
-            if let Some(last) = missile.path.last() {
-                gizmos.line(*last, pos, bevy::color::palettes::css::ORANGE);
+            if let Some((last_pos, last_phase)) = missile.path.last() {
+                let color = match last_phase {
+                    FlightPhase::Boost => bevy::color::palettes::css::YELLOW,
+                    FlightPhase::Ballistic => bevy::color::palettes::css::AQUA,
+                    FlightPhase::ReEntry => bevy::color::palettes::css::RED,
+                    FlightPhase::Landed => bevy::color::palettes::css::GREEN,
+                };
+                gizmos.line(*last_pos, pos, color);
             }
         }
     }
@@ -379,7 +396,8 @@ fn egui_stats_system(
     _settings: Res<SimulationSettings>,
     active_specs: Res<ActiveMissileSpecs>,
 ) {
-    // Avoid panics on first frames if egui isn't fully initialized with fonts
+    // Avoid panics on first frames if egui isn't
+    // fully initialized with fonts
     if time.elapsed_secs() < 0.2 {
         return;
     }

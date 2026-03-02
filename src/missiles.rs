@@ -307,7 +307,7 @@ impl PhysicsModel for BallisticMissilePhysics {
 
         let phase = if timer < self.specs.burn_time {
             FlightPhase::Boost
-        } else if altitude > 40000.0 || velocity.dot(position) >= 0.0 {
+        } else if altitude > 100000.0 || velocity.dot(position) >= 0.0 {
             FlightPhase::Ballistic
         } else {
             FlightPhase::ReEntry
