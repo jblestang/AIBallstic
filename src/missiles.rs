@@ -92,6 +92,7 @@ pub enum FlightPhase {
 
 pub trait PhysicsModel: Send + Sync {
     fn name(&self) -> &str;
+    fn specs(&self) -> &MissileSpecs;
     fn compute_acceleration(
         &self, 
         position: DVec3, 
@@ -121,6 +122,7 @@ impl BallisticMissilePhysics {
 
 impl PhysicsModel for BallisticMissilePhysics {
     fn name(&self) -> &str { self.specs.name }
+    fn specs(&self) -> &MissileSpecs { &self.specs }
 
     fn compute_acceleration(
         &self, 

@@ -23,13 +23,10 @@ pub struct Missile {
 }
 
 #[derive(Component)]
-pub struct Sun;
-
-#[derive(Component)]
 struct Earth;
 
-#[derive(Resource)]
-pub struct ActiveMissileSpecs(pub MissileSpecs);
+#[derive(Component)]
+struct Sun;
 
 #[derive(Resource)]
 struct SimulationSettings {
@@ -40,7 +37,34 @@ struct SimulationSettings {
     phi: f32,   // Vertical angle
     coriolis_enabled: bool,
     centrifugal_enabled: bool,
+    show_radar_coverage: bool,
 }
+
+#[derive(Resource)]
+pub struct ActiveMissileSpecs(pub MissileSpecs);
+
+// Radar Tracking Resources
+#[derive(Resource, Default)]
+struct TrackedMissileState {
+    pub position_ecef: Option<DVec3>,
+    pub velocity_ecef: Option<DVec3>,
+    pub mass: Option<f64>,
+    pub timer: Option<f32>,
+    pub specs: Option<MissileSpecs>,
+}
+
+#[derive(Resource, Default)]
+struct ImpactPrediction {
+    pub coordinates_ecef: Option<DVec3>,
+}
+
+#[derive(Component)]
+struct RadarStation {
+    pub position_ecef: DVec3,
+    pub range: f64,
+    pub scan_timer: f32,
+}
+
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -84,11 +108,14 @@ fn main() {
             phi: 0.5, // Slight tilt
             coriolis_enabled: true,
             centrifugal_enabled: true,
+            show_radar_coverage: true,
         })
+        .init_resource::<TrackedMissileState>()
+        .init_resource::<ImpactPrediction>()
         .add_systems(Startup, setup)
         .add_systems(Update, (
             egui_stats_system,
-            (physics_system, trajectory_system, camera_system, input_system, solar_lighting_system)
+            (physics_system, trajectory_system, camera_system, input_system, solar_lighting_system, radar_scan_system, impact_prediction_system)
                 .after(egui_stats_system),
         ))
         .run();
@@ -131,6 +158,15 @@ fn setup(
         Transform::from_xyz(4.0 * EARTH_RADIUS as f32, 0.0, 2.0 * EARTH_RADIUS as f32).looking_at(Vec3::ZERO, Vec3::Y),
         Sun
     ));
+
+    // Radar Station (E.g., Romania / Deveselu for Aegis Ashore, or generic European location)
+    // Let's place it somewhere in Europe to track the Tehran->Moscow flight.
+    // Coordinates: 44.07, 24.31 (Deveselu, Romania)
+    commands.spawn(RadarStation {
+        position_ecef: geodetic_to_ecef(44.07, 24.31, 100.0),
+        range: 5_000_000.0, // 5000 km
+        scan_timer: 0.0,
+    });
 
     // Launch from TEHRAN, IR
     // Geodetic: 35.6892° N, 51.3890° E
@@ -240,18 +276,155 @@ fn physics_system(
     }
 }
 
+// ----------------------------------------------------------------------------
+// Radar & Impact Prediction Systems
+// ----------------------------------------------------------------------------
+
+fn radar_scan_system(
+    time: Res<Time>,
+    mut radar_query: Query<&mut RadarStation>,
+    missile_query: Query<&Missile>,
+    mut tracked_state: ResMut<TrackedMissileState>,
+) {
+    let dt = time.delta_secs();
+    
+    for mut radar in radar_query.iter_mut() {
+        radar.scan_timer += dt;
+        
+        // 1Hz refresh rate
+        if radar.scan_timer >= 1.0 {
+            radar.scan_timer = 0.0;
+            
+            for missile in missile_query.iter() {
+                // If landed, stop tracking
+                if missile.phase == FlightPhase::Landed {
+                    continue;
+                }
+                
+                let dist = radar.position_ecef.distance(missile.position_ecef);
+                
+                // Simple Line of Sight Check (is it above the horizon from radar's perspective?)
+                // and within maximum radar range (5000km).
+                let radar_norm = radar.position_ecef.normalize();
+                let vec_to_missile = (missile.position_ecef - radar.position_ecef).normalize();
+                let is_above_horizon = radar_norm.dot(vec_to_missile) > 0.0;
+                
+                if dist <= radar.range && is_above_horizon {
+                    // Radar has acquired the target! Update tracked state.
+                    tracked_state.position_ecef = Some(missile.position_ecef);
+                    tracked_state.velocity_ecef = Some(missile.velocity_ecef);
+                    tracked_state.mass = Some(missile.mass);
+                    tracked_state.timer = Some(missile.timer);
+                    tracked_state.specs = Some(missile.model.specs().clone());
+                }
+            }
+        }
+    }
+}
+
+fn impact_prediction_system(
+    tracked_state: Res<TrackedMissileState>,
+    mut prediction: ResMut<ImpactPrediction>,
+    settings: Res<SimulationSettings>,
+) {
+    // Only run the prediction if the tracked state has been updated.
+    if !tracked_state.is_changed() || tracked_state.position_ecef.is_none() {
+        return;
+    }
+    
+    let mut pos = tracked_state.position_ecef.unwrap();
+    let mut vel = tracked_state.velocity_ecef.unwrap();
+    let mut mass = tracked_state.mass.unwrap();
+    let mut timer = tracked_state.timer.unwrap();
+    let specs = tracked_state.specs.unwrap();
+    
+    let model = BallisticMissilePhysics::new(specs);
+    // Fast-forward fixed time-step simulation (using larger steps for performance)
+    let dt: f32 = 1.0; 
+    let mut predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
+    
+    // Safety break mechanism to prevent infinite loops if prediction fails to return to earth
+    let mut iterations = 0; 
+    
+    while predicted_alt > 0.0 && iterations < 10000 {
+        iterations += 1;
+        let r = pos.length();
+        
+        let gravity_dir = -pos.normalize();
+        let gravity_accel = gravity_dir * (GRAVITY_CONSTANT / (r * r));
+
+        let coriolis_accel = if settings.coriolis_enabled {
+            -2.0 * EARTH_OMEGA.cross(vel)
+        } else {
+            DVec3::ZERO
+        };
+        
+        let centrifugal_accel = if settings.centrifugal_enabled {
+            -EARTH_OMEGA.cross(EARTH_OMEGA.cross(pos))
+        } else {
+            DVec3::ZERO
+        };
+
+        let (model_accel, _, mass_delta) = model.compute_acceleration(
+            pos, vel, mass, timer, dt
+        );
+
+        let total_accel = gravity_accel + coriolis_accel + centrifugal_accel + model_accel;
+        
+        vel += total_accel * dt as f64;
+        pos += vel * dt as f64;
+        
+        mass += mass_delta;
+        timer += dt;
+        predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
+    }
+    
+    prediction.coordinates_ecef = Some(pos);
+}
+
+// ----------------------------------------------------------------------------
+// Visualization System
+// ----------------------------------------------------------------------------
+
 fn trajectory_system(
     mut gizmos: Gizmos,
     query: Query<&Missile>,
+    radar_query: Query<&RadarStation>,
+    prediction: Res<ImpactPrediction>,
+    settings: Res<SimulationSettings>,
 ) {
     // Target Markers
     // Tehran - RED
     let tehran = geodetic_to_ecef(35.6892, 51.3890, 0.0).as_vec3();
     gizmos.sphere(tehran, 50000.0, bevy::color::palettes::css::RED);
 
-    // Moscow - MAGENTA
-    let moscow = geodetic_to_ecef(MOSCOW_LAT, MOSCOW_LON, 0.0).as_vec3();
-    gizmos.sphere(moscow, 50000.0, bevy::color::palettes::css::MAGENTA);
+    // Radar Stations
+    if settings.show_radar_coverage {
+        for radar in radar_query.iter() {
+            // Draw radar station
+            gizmos.sphere(radar.position_ecef.as_vec3(), 75000.0, bevy::color::palettes::css::BLUE);
+        }
+    }
+
+    // Impact Prediction
+    if let Some(predicted_loc) = prediction.coordinates_ecef {
+        // Draw a pulsating/obvious marker for the predicted impact
+        let time_sec = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+        let pulse = (time_sec * 5.0).sin() as f32; // -1 to 1
+        let radius = 60000.0 + (pulse * 20000.0); // 40km to 80km pulsing
+        
+        gizmos.sphere(predicted_loc.as_vec3(), radius, bevy::color::palettes::css::ORANGE_RED);
+        
+        // Draw an "X" crosshair extending outward
+        let p_vec = predicted_loc.as_vec3();
+        let up = p_vec.normalize();
+        let right = up.cross(Vec3::Y).normalize_or_zero();
+        let fwd = up.cross(right).normalize_or_zero();
+        
+        let cross_size = 150000.0;
+        gizmos.line(p_vec - right * cross_size, p_vec + right * cross_size, bevy::color::palettes::css::ORANGE_RED);
+        gizmos.line(p_vec - fwd * cross_size, p_vec + fwd * cross_size, bevy::color::palettes::css::ORANGE_RED);
+    }
 
     for missile in query.iter() {
         let pos = missile.position_ecef.as_vec3();
