@@ -52,7 +52,7 @@ struct TrackedMissileState {
 
 #[derive(Resource, Default)]
 struct ImpactPrediction {
-    pub coordinates_ecef: Option<DVec3>,
+    pub coordinates_ecef: Vec<DVec3>,
 }
 
 #[derive(Component)]
@@ -307,10 +307,26 @@ fn radar_scan_system(
                 let is_above_horizon = radar_norm.dot(vec_to_missile) > 0.0;
                 
                 if dist <= radar.range && is_above_horizon {
-                    // Radar has acquired the target! Update tracked state.
-                    // A real radar only measures positional/kinematic data, so we don't cheat by copying mass or specs.
-                    tracked_state.position_ecef = Some(missile.position_ecef);
-                    tracked_state.velocity_ecef = Some(missile.velocity_ecef);
+                    // Radar has acquired the target! Update tracked state with NOISE.
+                    // A real radar only measures positional/kinematic data with some CEP error.
+                    use rand::Rng;
+                    let mut rng = rand::thread_rng();
+                    
+                    // Simple uniform noise: +/- 1000 meters for position, +/- 50 m/s for velocity
+                    let pos_noise = DVec3::new(
+                        rng.gen_range(-1000.0..1000.0),
+                        rng.gen_range(-1000.0..1000.0),
+                        rng.gen_range(-1000.0..1000.0)
+                    );
+                    
+                    let vel_noise = DVec3::new(
+                        rng.gen_range(-50.0..50.0),
+                        rng.gen_range(-50.0..50.0),
+                        rng.gen_range(-50.0..50.0)
+                    );
+                    
+                    tracked_state.position_ecef = Some(missile.position_ecef + pos_noise);
+                    tracked_state.velocity_ecef = Some(missile.velocity_ecef + vel_noise);
                 }
             }
         }
@@ -327,63 +343,82 @@ fn impact_prediction_system(
         return;
     }
     
-    let mut pos = tracked_state.position_ecef.unwrap();
-    let mut vel = tracked_state.velocity_ecef.unwrap();
+    let base_pos = tracked_state.position_ecef.unwrap();
+    let base_vel = tracked_state.velocity_ecef.unwrap();
     
-    // Fast-forward fixed time-step simulation (using larger steps for performance)
-    let dt: f32 = 1.0; 
-    let mut predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
+    // Clear previous predictions
+    prediction.coordinates_ecef.clear();
     
-    // Safety break mechanism to prevent infinite loops if prediction fails to return to earth
-    let mut iterations = 0; 
-    
-    // Radar does not know the exact missile specs. We use a generic
-    // Ballistic Coefficient estimation for a typical Re-Entry Vehicle (RV).
-    let est_mass = 500.0; // kg
-    let est_area = 0.5;   // m^2
-    
-    while predicted_alt > 0.0 && iterations < 10000 {
-        iterations += 1;
-        let r = pos.length();
-        let altitude = (r - EARTH_RADIUS).max(0.0);
-        
-        let gravity_dir = -pos.normalize();
-        let gravity_accel = gravity_dir * (GRAVITY_CONSTANT / (r * r));
+    let n_simulations = 50;
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
 
-        let coriolis_accel = if settings.coriolis_enabled {
-            -2.0 * EARTH_OMEGA.cross(vel)
-        } else {
-            DVec3::ZERO
-        };
+    for _ in 0..n_simulations {
+        // Fast-forward fixed time-step simulation
+        let dt: f32 = 1.0; 
         
-        let centrifugal_accel = if settings.centrifugal_enabled {
-            -EARTH_OMEGA.cross(EARTH_OMEGA.cross(pos))
-        } else {
-            DVec3::ZERO
-        };
+        // Inject per-trajectory variance to build a scatter plot.
+        // E.g., slightly different atmospheric responses or RV estimations.
+        let mut pos = base_pos + DVec3::new(
+            rng.gen_range(-500.0..500.0),
+            rng.gen_range(-500.0..500.0),
+            rng.gen_range(-500.0..500.0)
+        );
+        let mut vel = base_vel + DVec3::new(
+            rng.gen_range(-10.0..10.0),
+            rng.gen_range(-10.0..10.0),
+            rng.gen_range(-10.0..10.0)
+        );
+        
+        // Randomize the Ballistic Coefficient bounds
+        let est_mass = rng.gen_range(400.0..600.0); // RV mass between 400kg - 600kg
+        let est_area = rng.gen_range(0.4..0.6);   // RV cross-section
+        
+        let mut predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
+        let mut iterations = 0; 
+        
+        while predicted_alt > 0.0 && iterations < 5000 {
+            iterations += 1;
+            let r = pos.length();
+            let altitude = (r - EARTH_RADIUS).max(0.0);
+            
+            let gravity_dir = -pos.normalize();
+            let gravity_accel = gravity_dir * (GRAVITY_CONSTANT / (r * r));
 
-        // Estimate Aerodynamic Drag
-        let (rho, sound_speed, _) = get_isa_properties(altitude);
-        let speed = vel.length();
-        let mach = speed / sound_speed;
-        let cd = get_mach_drag(mach);
-        
-        let drag_force = -0.5 * rho * (speed * speed) * cd * est_area;
-        let drag_accel = if speed > 1e-3 {
-            (vel.normalize() * drag_force) / est_mass
-        } else {
-            DVec3::ZERO
-        };
+            let coriolis_accel = if settings.coriolis_enabled {
+                -2.0 * EARTH_OMEGA.cross(vel)
+            } else {
+                DVec3::ZERO
+            };
+            
+            let centrifugal_accel = if settings.centrifugal_enabled {
+                -EARTH_OMEGA.cross(EARTH_OMEGA.cross(pos))
+            } else {
+                DVec3::ZERO
+            };
 
-        let total_accel = gravity_accel + coriolis_accel + centrifugal_accel + drag_accel;
+            let (rho, sound_speed, _) = get_isa_properties(altitude);
+            let speed = vel.length();
+            let mach = speed / sound_speed;
+            let cd = get_mach_drag(mach);
+            
+            let drag_force = -0.5 * rho * (speed * speed) * cd * est_area;
+            let drag_accel = if speed > 1e-3 {
+                (vel.normalize() * drag_force) / est_mass
+            } else {
+                DVec3::ZERO
+            };
+
+            let total_accel = gravity_accel + coriolis_accel + centrifugal_accel + drag_accel;
+            
+            vel += total_accel * dt as f64;
+            pos += vel * dt as f64;
+            
+            predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
+        }
         
-        vel += total_accel * dt as f64;
-        pos += vel * dt as f64;
-        
-        predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
+        prediction.coordinates_ecef.push(pos);
     }
-    
-    prediction.coordinates_ecef = Some(pos);
 }
 
 // ----------------------------------------------------------------------------
@@ -410,24 +445,68 @@ fn trajectory_system(
         }
     }
 
-    // Impact Prediction
-    if let Some(predicted_loc) = prediction.coordinates_ecef {
-        // Draw a pulsating/obvious marker for the predicted impact
-        let time_sec = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
-        let pulse = (time_sec * 5.0).sin() as f32; // -1 to 1
-        let radius = 60000.0 + (pulse * 20000.0); // 40km to 80km pulsing
+    // Impact Prediction (CEP Scatter Visualization)
+    if !prediction.coordinates_ecef.is_empty() {
+        let mut centroid = DVec3::ZERO;
         
-        gizmos.sphere(predicted_loc.as_vec3(), radius, bevy::color::palettes::css::ORANGE_RED);
+        // Draw individual prediction points in the swarm
+        for p in &prediction.coordinates_ecef {
+            centroid += *p;
+            gizmos.sphere(p.as_vec3(), 15000.0, bevy::color::palettes::css::ORANGE);
+        }
         
-        // Draw an "X" crosshair extending outward
-        let p_vec = predicted_loc.as_vec3();
+        centroid /= prediction.coordinates_ecef.len() as f64;
+        
+        // Calculate 50% radius (CEP)
+        let mut distances: Vec<f64> = prediction.coordinates_ecef.iter()
+            .map(|p| p.distance(centroid))
+            .collect();
+        // Sort distances to find median for CEP definition
+        // We use sort_by directly since floats can't be purely fully ordered, but this is safe here
+        distances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        
+        let cep_radius = distances[distances.len() / 2];
+        
+        // Draw the CEP boundary circle
+        let p_vec = centroid.as_vec3();
         let up = p_vec.normalize();
         let right = up.cross(Vec3::Y).normalize_or_zero();
         let fwd = up.cross(right).normalize_or_zero();
         
+        // Draw a multi-segment circle utilizing lines for gizmos approximation
+        let segments = 32;
+        let first_point = {
+            let angle: f32 = 0.0;
+            p_vec + (right * angle.cos() + fwd * angle.sin()) * cep_radius as f32
+        };
+        let mut prev_point: Option<Vec3> = Some(first_point);
+        
+        for i in 0..=segments {
+            let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
+            let cur_point = p_vec + (right * angle.cos() + fwd * angle.sin()) * cep_radius as f32;
+            
+            if let Some(prev) = prev_point {
+                gizmos.line(prev, cur_point, bevy::color::palettes::css::RED);
+            }
+            prev_point = Some(cur_point);
+        }
+        
+        // Close the circle
+        if let Some(prev) = prev_point {
+            gizmos.line(prev, first_point, bevy::color::palettes::css::RED);
+        }
+        
+        // Pulsate the main centroid marker
+        let time_sec = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+        let pulse = (time_sec * 5.0).sin() as f32; // -1 to 1
+        let center_radius = 40000.0 + (pulse * 15000.0);
+        
+        gizmos.sphere(p_vec, center_radius, bevy::color::palettes::css::RED);
+        
+        // X marker
         let cross_size = 150000.0;
-        gizmos.line(p_vec - right * cross_size, p_vec + right * cross_size, bevy::color::palettes::css::ORANGE_RED);
-        gizmos.line(p_vec - fwd * cross_size, p_vec + fwd * cross_size, bevy::color::palettes::css::ORANGE_RED);
+        gizmos.line(p_vec - right * cross_size, p_vec + right * cross_size, bevy::color::palettes::css::RED);
+        gizmos.line(p_vec - fwd * cross_size, p_vec + fwd * cross_size, bevy::color::palettes::css::RED);
     }
 
     for missile in query.iter() {
