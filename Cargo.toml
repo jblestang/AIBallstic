@@ -1,0 +1,11 @@
+[package]
+name = "aiballistic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bevy = { version = "0.17", features = ["jpeg"] }
+bevy_egui = { version = "0.37", features = ["manage_clipboard", "open_url"] }
+glam = "0.30"
+rand = "0.8"
+chrono = "0.4"
