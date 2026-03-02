@@ -142,7 +142,7 @@ fn main() {
             coriolis_enabled: true,
             centrifugal_enabled: true,
             show_radar_coverage: true,
-            texture_lon_offset: -14.25, // Initial guess for Tehran->Aleppo offset
+            texture_lon_offset: 0.0, // Initial guess for Tehran->Aleppo offset
         })
         .init_resource::<TrackedMissileState>()
         .init_resource::<ImpactPrediction>()
@@ -1130,7 +1130,7 @@ fn egui_stats_system(
                                 // Standard ECEF to Lat/Lon
                                 let r = ecef_pos.length();
                                 let lat = (ecef_pos.y / r).asin().to_degrees();
-                                let lon = -rotated_z.atan2(rotated_x).to_degrees();
+                                let lon = rotated_x.atan2(rotated_z).to_degrees();
                                 
                                 let lat_str = if lat >= 0.0 { format!("{:.4}° N", lat) } else { format!("{:.4}° S", -lat) };
                                 let lon_str = if lon >= 0.0 { format!("{:.4}° E", lon) } else { format!("{:.4}° W", -lon) };
