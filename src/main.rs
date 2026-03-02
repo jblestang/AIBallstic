@@ -48,9 +48,6 @@ pub struct ActiveMissileSpecs(pub MissileSpecs);
 struct TrackedMissileState {
     pub position_ecef: Option<DVec3>,
     pub velocity_ecef: Option<DVec3>,
-    pub mass: Option<f64>,
-    pub timer: Option<f32>,
-    pub specs: Option<MissileSpecs>,
 }
 
 #[derive(Resource, Default)]
@@ -311,11 +308,9 @@ fn radar_scan_system(
                 
                 if dist <= radar.range && is_above_horizon {
                     // Radar has acquired the target! Update tracked state.
+                    // A real radar only measures positional/kinematic data, so we don't cheat by copying mass or specs.
                     tracked_state.position_ecef = Some(missile.position_ecef);
                     tracked_state.velocity_ecef = Some(missile.velocity_ecef);
-                    tracked_state.mass = Some(missile.mass);
-                    tracked_state.timer = Some(missile.timer);
-                    tracked_state.specs = Some(missile.model.specs().clone());
                 }
             }
         }
@@ -334,11 +329,7 @@ fn impact_prediction_system(
     
     let mut pos = tracked_state.position_ecef.unwrap();
     let mut vel = tracked_state.velocity_ecef.unwrap();
-    let mut mass = tracked_state.mass.unwrap();
-    let mut timer = tracked_state.timer.unwrap();
-    let specs = tracked_state.specs.unwrap();
     
-    let model = BallisticMissilePhysics::new(specs);
     // Fast-forward fixed time-step simulation (using larger steps for performance)
     let dt: f32 = 1.0; 
     let mut predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
@@ -346,9 +337,15 @@ fn impact_prediction_system(
     // Safety break mechanism to prevent infinite loops if prediction fails to return to earth
     let mut iterations = 0; 
     
+    // Radar does not know the exact missile specs. We use a generic
+    // Ballistic Coefficient estimation for a typical Re-Entry Vehicle (RV).
+    let est_mass = 500.0; // kg
+    let est_area = 0.5;   // m^2
+    
     while predicted_alt > 0.0 && iterations < 10000 {
         iterations += 1;
         let r = pos.length();
+        let altitude = (r - EARTH_RADIUS).max(0.0);
         
         let gravity_dir = -pos.normalize();
         let gravity_accel = gravity_dir * (GRAVITY_CONSTANT / (r * r));
@@ -365,17 +362,24 @@ fn impact_prediction_system(
             DVec3::ZERO
         };
 
-        let (model_accel, _, mass_delta) = model.compute_acceleration(
-            pos, vel, mass, timer, dt
-        );
+        // Estimate Aerodynamic Drag
+        let (rho, sound_speed, _) = get_isa_properties(altitude);
+        let speed = vel.length();
+        let mach = speed / sound_speed;
+        let cd = get_mach_drag(mach);
+        
+        let drag_force = -0.5 * rho * (speed * speed) * cd * est_area;
+        let drag_accel = if speed > 1e-3 {
+            (vel.normalize() * drag_force) / est_mass
+        } else {
+            DVec3::ZERO
+        };
 
-        let total_accel = gravity_accel + coriolis_accel + centrifugal_accel + model_accel;
+        let total_accel = gravity_accel + coriolis_accel + centrifugal_accel + drag_accel;
         
         vel += total_accel * dt as f64;
         pos += vel * dt as f64;
         
-        mass += mass_delta;
-        timer += dt;
         predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
     }
     
