@@ -2,6 +2,24 @@ use bevy::prelude::*;
 use glam::DVec3;
 use crate::*;
 
+// --- Physical Constants (ISA & Earth) ---
+pub const EARTH_RADIUS: f64 = 6_371_000.0;
+pub const R_AIR: f64 = 287.05;
+pub const GAMMA: f64 = 1.4;
+pub const T0: f64 = 288.15;
+pub const P0: f64 = 101325.0;
+pub const G0: f64 = 9.80665;
+
+// Gravity & Rotation
+pub const G: f64 = 6.67430e-11;
+pub const EARTH_MASS: f64 = 5.972e24;
+pub const GRAVITY_CONSTANT: f64 = G * EARTH_MASS;
+pub const EARTH_OMEGA: DVec3 = DVec3::new(0.0, 7.2921159e-5, 0.0); // Rad/s around Y axis
+
+// Target Coordinates
+pub const MOSCOW_LAT: f64 = 55.7558;
+pub const MOSCOW_LON: f64 = 37.6173;
+
 // --- Missile Specification Structure ---
 
 #[derive(Debug, Clone, Copy, Reflect)]
@@ -184,5 +202,44 @@ impl PhysicsModel for BallisticMissilePhysics {
             ("Isp".into(), current_isp_str),
             ("Pressure Ratio".into(), p_ratio_str),
         ]
+    }
+}
+
+pub fn get_isa_properties(altitude: f64) -> (f64, f64, f64) {
+    let (t, p) = if altitude < 11000.0 {
+        let t = T0 - 0.0065 * altitude;
+        let p = P0 * (t / T0).powf(G0 / (0.0065 * R_AIR));
+        (t, p)
+    } else if altitude < 20000.0 {
+        let t = 216.65;
+        let p_11 = P0 * (216.65 / T0).powf(G0 / (0.0065 * R_AIR));
+        let p = p_11 * f64::exp(-G0 * (altitude - 11000.0) / (R_AIR * t));
+        (t, p)
+    } else if altitude < 32000.0 {
+        let t = 216.65 + 0.001 * (altitude - 20000.0);
+        let p_20 = 22632.0;
+        let p = p_20 * (t / 216.65).powf(-G0 / (0.001 * R_AIR));
+        (t, p)
+    } else {
+        let t = 228.65;
+        let rho = 1.225 * f64::exp(-altitude / 8500.0);
+        let p = rho * R_AIR * t;
+        return (rho, (GAMMA * R_AIR * t).sqrt(), p);
+    };
+
+    let rho = p / (R_AIR * t);
+    let sound_speed = (GAMMA * R_AIR * t).sqrt();
+    (rho, sound_speed, p)
+}
+
+pub fn get_mach_drag(mach: f64) -> f64 {
+    if mach < 0.8 {
+        0.15
+    } else if mach < 1.2 {
+        0.15 + 0.35 * (mach - 0.8) / 0.4
+    } else if mach < 2.0 {
+        0.5 * (1.2 / mach).powf(0.5)
+    } else {
+        (0.4 - (mach - 2.0) * 0.05).max(0.3)
     }
 }

@@ -8,22 +8,7 @@ use missiles::*;
 use chrono::{Datelike, Timelike, Utc};
 
 // Constants
-pub const EARTH_RADIUS: f64 = 6_371_000.0; // meters
-pub const G: f64 = 6.67430e-11;
-pub const EARTH_MASS: f64 = 5.972e24;
-pub const GRAVITY_CONSTANT: f64 = G * EARTH_MASS;
-pub const EARTH_OMEGA: DVec3 = DVec3::new(0.0, 7.2921159e-5, 0.0); // Rad/s around Y axis in this coordinate system
-
-// Target Coordinates (Moscow)
-pub const MOSCOW_LAT: f64 = 55.7558;
-pub const MOSCOW_LON: f64 = 37.6173;
-
-// Physical Constants for ISA
-pub const R_AIR: f64 = 287.05; // J/(kg*K)
-pub const GAMMA: f64 = 1.4;
-pub const T0: f64 = 288.15; // Sea level temperature (K)
-pub const P0: f64 = 101325.0; // Sea level pressure (Pa)
-pub const G0: f64 = 9.80665;
+// Real-world alignment is handled in missiles.rs constants
 
 #[derive(Component)]
 pub struct Missile {
@@ -270,59 +255,6 @@ pub fn geodetic_to_ecef(lat: f64, lon: f64, alt: f64) -> DVec3 {
         r * lat_rad.sin(),
         r * lat_rad.cos() * lon_rad.sin(),
     )
-}
-
-pub fn get_isa_properties(altitude: f64) -> (f64, f64, f64) {
-    // Piecewise International Standard Atmosphere
-    let (t, p) = if altitude < 11000.0 {
-        // Troposphere
-        let t = T0 - 0.0065 * altitude;
-        let p = P0 * (t / T0).powf(G0 / (0.0065 * R_AIR));
-        (t, p)
-    } else if altitude < 20000.0 {
-        // Tropopause
-        let t = 216.65;
-        let p_11 = P0 * (216.65 / T0).powf(G0 / (0.0065 * R_AIR));
-        let p = p_11 * f64::exp(-G0 * (altitude - 11000.0) / (R_AIR * t));
-        (t, p)
-    } else if altitude < 32000.0 {
-        // Stratosphere layer 1
-        let t = 216.65 + 0.001 * (altitude - 20000.0);
-        let p_20 = 22632.0; // Approx pressure at 20km
-        let p = p_20 * (t / 216.65).powf(-G0 / (0.001 * R_AIR));
-        (t, p)
-    } else {
-        // High altitude (Mesosphere/Thermosphere - extremely thin)
-        let t = 228.65; // Simplified
-        let rho = 1.225 * f64::exp(-altitude / 8500.0); // Fallback to simple model
-        let p = rho * R_AIR * t;
-        return (rho, (GAMMA * R_AIR * t).sqrt(), p);
-    };
-
-    let rho = p / (R_AIR * t);
-    let sound_speed = (GAMMA * R_AIR * t).sqrt();
-    (rho, sound_speed, p)
-}
-
-pub fn get_mach_drag(mach: f64) -> f64 {
-    // Dynamic Drag Coefficient Curve for a typical missile
-    if mach < 0.8 {
-        0.15 // Low subsonic drag
-    } else if mach < 1.1 {
-        // Transonic spike (Mach 1.0 peak)
-        let t = (mach - 0.8) / 0.3;
-        if mach < 1.0 {
-            0.15 + t * 0.45 // Up to 0.6 at M=1.0
-        } else {
-            0.6 - (mach - 1.0) * 0.5 // Dropping down to 0.55 at M=1.1
-        }
-    } else if mach < 2.0 {
-        // Supersonic
-        0.55 - (mach - 1.1) * 0.15 // Dropping to 0.4-ish
-    } else {
-        // Hypersonic
-        (0.4 - (mach - 2.0) * 0.05).max(0.3)
-    }
 }
 
 
