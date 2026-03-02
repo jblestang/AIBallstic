@@ -295,6 +295,7 @@ fn radar_scan_system(
         
         // 1Hz refresh rate
         if radar.scan_timer >= 1.0 {
+            let scan_dt = radar.scan_timer;
             radar.scan_timer = 0.0;
             
             for missile in missile_query.iter() {
@@ -346,52 +347,60 @@ fn radar_scan_system(
                         let mut x = tracked_state.ekf_state.unwrap();
                         let mut P = tracked_state.ekf_covariance.unwrap();
                         
-                        // 1. Predict Step (Propagate state 1 second forward)
+                        // 1. Predict Step (Propagate state forward by scan_dt)
                         let mut x_pred = x;
-                        let pos = DVec3::new(x[0], x[1], x[2]);
-                        let vel = DVec3::new(x[3], x[4], x[5]);
+                        let mut pos = DVec3::new(x[0], x[1], x[2]);
+                        let mut vel = DVec3::new(x[3], x[4], x[5]);
                         
-                        // Simple 1 sec integration using generic bounds
-                        let r = pos.length();
-                        let altitude = (r - EARTH_RADIUS).max(0.0);
-                        let gravity = -pos.normalize() * (GRAVITY_CONSTANT / (r * r));
+                        // Break the integration into smaller steps for stability
+                        let integration_steps = 10;
+                        let step_dt = scan_dt / (integration_steps as f32);
                         
-                        let (rho, sound, _) = get_isa_properties(altitude);
-                        let mach = vel.length() / sound;
-                        let cd = get_mach_drag(mach);
-                        let drag_force = -0.5 * rho * vel.length_squared() * cd * 0.5; // est area 0.5
-                        let drag_accel = if vel.length() > 1e-3 { (vel.normalize() * drag_force) / 500.0 } else { DVec3::ZERO }; // est mass 500
-
-                        // For simplicity, skip Coriolis in EKF prediction to save Jacobian complexity, or treat as noise.
-                        let total_accel = gravity + drag_accel;
+                        for _ in 0..integration_steps {
+                            let r = pos.length();
+                            let altitude = (r - EARTH_RADIUS).max(0.0);
+                            let gravity = -pos.normalize() * (GRAVITY_CONSTANT / (r * r));
+                            
+                            let (rho, sound, _) = get_isa_properties(altitude);
+                            let mach = vel.length() / sound;
+                            let cd = get_mach_drag(mach);
+                            let drag_force = -0.5 * rho * vel.length_squared() * cd * 0.5; // est area 0.5
+                            let drag_accel = if vel.length() > 1e-3 { (vel.normalize() * drag_force) / 500.0 } else { DVec3::ZERO }; // est mass 500
+                            
+                            let total_accel = gravity + drag_accel;
+                            
+                            vel += total_accel * step_dt as f64;
+                            pos += vel * step_dt as f64;
+                        }
                         
                         // New predicted state
-                        x_pred[0] += vel.x * 1.0; x_pred[1] += vel.y * 1.0; x_pred[2] += vel.z * 1.0;
-                        x_pred[3] += total_accel.x * 1.0; x_pred[4] += total_accel.y * 1.0; x_pred[5] += total_accel.z * 1.0;
+                        x_pred[0] = pos.x; x_pred[1] = pos.y; x_pred[2] = pos.z;
+                        x_pred[3] = vel.x; x_pred[4] = vel.y; x_pred[5] = vel.z;
 
                         // Process Noise Covariance Q (uncertainty in our physics model vs reality)
-                        let mut Q = SMatrix::<f64, 6, 6>::zeros();
-                        Q[(0,0)] = 100.0; Q[(1,1)] = 100.0; Q[(2,2)] = 100.0;
-                        Q[(3,3)] = 10.0;  Q[(4,4)] = 10.0;  Q[(5,5)] = 10.0;
+                        let mut q = SMatrix::<f64, 6, 6>::zeros();
+                        // Drastically increase Q because our physics model assumes NO thrust (ballistic re-entry).
+                        // When the missile is boosting, it accelerates greatly, and a small Q causes the filter to diverge!
+                        q[(0,0)] = 50_000.0; q[(1,1)] = 50_000.0; q[(2,2)] = 50_000.0;
+                        q[(3,3)] = 5_000.0;  q[(4,4)] = 5_000.0;  q[(5,5)] = 5_000.0;
                         
                         // Numerical Jacobian F for State Transition mapping
-                        let mut F = SMatrix::<f64, 6, 6>::identity();
-                        // Position derives from Velocity over dt=1.0
-                        F[(0,3)] = 1.0; F[(1,4)] = 1.0; F[(2,5)] = 1.0;
-                        // For a rigid setup, we can approximate the rest of F as identity to save deep partial derivatives
-                        // as the updates are fast enough (1Hz) that P won't diverge entirely on Q alone.
+                        let mut f = SMatrix::<f64, 6, 6>::identity();
+                        // Position derives from Velocity over scan_dt
+                        f[(0,3)] = scan_dt as f64; f[(1,4)] = scan_dt as f64; f[(2,5)] = scan_dt as f64;
+                        // Approximate the rest to save deep partial derivatives
                         
-                        let P_pred = F * P * F.transpose() + Q;
+                        let p_pred = f * P * f.transpose() + q;
 
                         // 2. Update Step
-                        let H = SMatrix::<f64, 6, 6>::identity(); // We measure all states directly
-                        let S = H * P_pred * H.transpose() + R;
-                        let K = P_pred * H.transpose() * S.try_inverse().unwrap_or(SMatrix::identity()); // Kalman Gain
+                        let h = SMatrix::<f64, 6, 6>::identity(); // We measure all states directly
+                        let s = h * p_pred * h.transpose() + R;
+                        let k = p_pred * h.transpose() * s.try_inverse().unwrap_or(SMatrix::identity()); // Kalman Gain
                         
-                        let y = z - (H * x_pred); // Innovation
-                        x = x_pred + K * y;
-                        let I = SMatrix::<f64, 6, 6>::identity();
-                        P = (I - K * H) * P_pred;
+                        let y = z - (h * x_pred); // Innovation
+                        x = x_pred + k * y;
+                        let i = SMatrix::<f64, 6, 6>::identity();
+                        P = (i - k * h) * p_pred;
 
                         tracked_state.ekf_state = Some(x);
                         tracked_state.ekf_covariance = Some(P);
