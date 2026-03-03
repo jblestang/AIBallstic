@@ -142,7 +142,7 @@ fn main() {
             coriolis_enabled: true,
             centrifugal_enabled: true,
             show_radar_coverage: true,
-            texture_lon_offset: 0.0, // Initial guess for Tehran->Aleppo offset
+            texture_lon_offset: -90.0, // Compensate for Bevy's U sphere anchor wrapping 90deg left
         })
         .init_resource::<TrackedMissileState>()
         .init_resource::<ImpactPrediction>()
