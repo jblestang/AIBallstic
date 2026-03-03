@@ -142,7 +142,7 @@ fn main() {
             coriolis_enabled: true,
             centrifugal_enabled: true,
             show_radar_coverage: true,
-            texture_lon_offset: -90.0, // Compensate for Bevy's U sphere anchor wrapping 90deg left
+            texture_lon_offset: 0.0, // Base UV mathematically aligns perfectly
         })
         .init_resource::<TrackedMissileState>()
         .init_resource::<ImpactPrediction>()
@@ -177,7 +177,11 @@ fn setup(
             ..default()
         })),
         Earth,
-        Transform::default(),
+        Transform::from_rotation(Quat::from_mat3(&bevy::math::Mat3::from_cols(
+            Vec3::new(-1.0, 0.0, 0.0), // X col
+            Vec3::new(0.0, 0.0, 1.0),  // Y col
+            Vec3::new(0.0, 1.0, 0.0),  // Z col
+        ))),
     ));
 
     // Light (Sun)
@@ -951,7 +955,7 @@ fn solar_lighting_system(
     let dist = 5.0 * EARTH_RADIUS;
     let x = dist * dec_rad.cos() * sun_lon_rad.cos();
     let y = dist * dec_rad.sin();
-    let z = dist * dec_rad.cos() * sun_lon_rad.sin();
+    let z = -dist * dec_rad.cos() * sun_lon_rad.sin();
     
     let sun_pos = Vec3::new(x as f32, y as f32, z as f32);
     
@@ -970,7 +974,7 @@ pub fn geodetic_to_ecef(lat: f64, lon: f64, alt: f64) -> DVec3 {
     DVec3::new(
         r * lat_rad.cos() * lon_rad.cos(),
         r * lat_rad.sin(),
-        r * lat_rad.cos() * lon_rad.sin(),
+        -r * lat_rad.cos() * lon_rad.sin(),
     )
 }
 
@@ -1112,8 +1116,8 @@ fn egui_stats_system(
                                 let ecef_pos = DVec3::new(hit_point.x as f64, hit_point.y as f64, hit_point.z as f64);
                                 let r = ecef_pos.length();
                                 let lat = (ecef_pos.y / r).asin().to_degrees();
-                                // We use z.atan2(x) because z=sin(lon), x=cos(lon).
-                                let lon = ecef_pos.z.atan2(ecef_pos.x).to_degrees();
+                                // We use (-z).atan2(x) because z= -sin(lon), x=cos(lon).
+                                let lon = (-ecef_pos.z).atan2(ecef_pos.x).to_degrees();
                                 
                                 let lat_str = if lat >= 0.0 { format!("{:.4}° N", lat) } else { format!("{:.4}° S", -lat) };
                                 let lon_str = if lon >= 0.0 { format!("{:.4}° E", lon) } else { format!("{:.4}° W", -lon) };
@@ -1160,7 +1164,12 @@ fn earth_alignment_system(
 ) {
     if settings.is_changed() {
         for mut transform in query.iter_mut() {
-            transform.rotation = Quat::from_rotation_y(settings.texture_lon_offset.to_radians());
+            transform.rotation = Quat::from_rotation_y(settings.texture_lon_offset.to_radians()) *
+            Quat::from_mat3(&bevy::math::Mat3::from_cols(
+                Vec3::new(-1.0, 0.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ));
         }
     }
 }
