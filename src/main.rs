@@ -152,7 +152,7 @@ fn main() {
             egui_stats_system,
             (
                 physics_system, trajectory_system, camera_system, input_system, 
-                solar_lighting_system, radar_scan_system, impact_prediction_system
+                solar_lighting_system, radar_scan_system, impact_prediction_system, earth_alignment_system
             ).after(egui_stats_system),
             (
                 abm_c2_system, spawn_abm_system, abm_guidance_system, abm_kill_system, explosion_system
@@ -177,18 +177,7 @@ fn setup(
             ..default()
         })),
         Earth,
-        // Texture Alignment:
-        // Texture North: +Z, Lon 0: -X, Lat 90E: -Y
-        // Physics North: +Y, Lon 0: +Z, Lat 90E: +X
-        // Matrix to map: R*Z=Y, R*(-X)=Z, R*(-Y)=X
-        Transform::from_rotation(
-            Quat::from_rotation_y((-14.25_f32).to_radians()) * 
-            Quat::from_mat3(&bevy::math::Mat3::from_cols(
-                Vec3::new(0.0, 0.0, -1.0), // R*X = -Z
-                Vec3::new(-1.0, 0.0, 0.0), // R*Y = -X
-                Vec3::new(0.0, 1.0, 0.0),  // R*Z = +Y
-            ))
-        ),
+        Transform::default(),
     ));
 
     // Light (Sun)
@@ -1163,4 +1152,15 @@ fn spawn_default_missile(commands: &mut Commands, active_specs: &ActiveMissileSp
         path: Vec::new(),
         model: Box::new(BallisticMissilePhysics::new(specs)),
     });
+}
+
+fn earth_alignment_system(
+    settings: Res<SimulationSettings>,
+    mut query: Query<&mut Transform, With<Earth>>,
+) {
+    if settings.is_changed() {
+        for mut transform in query.iter_mut() {
+            transform.rotation = Quat::from_rotation_y(settings.texture_lon_offset.to_radians());
+        }
+    }
 }
