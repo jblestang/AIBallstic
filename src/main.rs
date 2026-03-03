@@ -960,9 +960,9 @@ fn solar_lighting_system(
     let dec_rad = (23.44f64).to_radians() * ((360.0 / 365.25) * (doy - 80.0)).to_radians().sin();
     
     let dist = 5.0 * EARTH_RADIUS;
-    let x = dist * dec_rad.cos() * sun_lon_rad.cos();
+    let x = dist * dec_rad.cos() * sun_lon_rad.sin();
     let y = dist * dec_rad.sin();
-    let z = dist * dec_rad.cos() * sun_lon_rad.sin();
+    let z = dist * dec_rad.cos() * sun_lon_rad.cos();
     
     let sun_pos = Vec3::new(x as f32, y as f32, z as f32);
     
@@ -979,9 +979,9 @@ pub fn geodetic_to_ecef(lat: f64, lon: f64, alt: f64) -> DVec3 {
     let lon_rad = lon.to_radians();
     let r = EARTH_RADIUS + alt;
     DVec3::new(
-        r * lat_rad.cos() * lon_rad.cos(),
-        r * lat_rad.sin(),
         r * lat_rad.cos() * lon_rad.sin(),
+        r * lat_rad.sin(),
+        r * lat_rad.cos() * lon_rad.cos(),
     )
 }
 
@@ -1123,8 +1123,8 @@ fn egui_stats_system(
                                 let ecef_pos = DVec3::new(hit_point.x as f64, hit_point.y as f64, hit_point.z as f64);
                                 let r = ecef_pos.length();
                                 let lat = (ecef_pos.y / r).asin().to_degrees();
-                                // We use z.atan2(x) because z=sin(lon), x=cos(lon).
-                                let lon = ecef_pos.z.atan2(ecef_pos.x).to_degrees();
+                                // We use x.atan2(z) because x=sin(lon), z=cos(lon).
+                                let lon = ecef_pos.x.atan2(ecef_pos.z).to_degrees();
                                 
                                 let lat_str = if lat >= 0.0 { format!("{:.4}° N", lat) } else { format!("{:.4}° S", -lat) };
                                 let lon_str = if lon >= 0.0 { format!("{:.4}° E", lon) } else { format!("{:.4}° W", -lon) };
