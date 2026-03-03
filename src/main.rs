@@ -152,7 +152,7 @@ fn main() {
             egui_stats_system,
             (
                 physics_system, trajectory_system, camera_system, input_system, 
-                solar_lighting_system, radar_scan_system, impact_prediction_system, earth_alignment_system
+                solar_lighting_system, radar_scan_system, impact_prediction_system
             ).after(egui_stats_system),
             (
                 abm_c2_system, spawn_abm_system, abm_guidance_system, abm_kill_system, explosion_system
@@ -778,30 +778,22 @@ fn trajectory_system(
         );
     }
 
-    // Helper to rotate physical ECEF to visual texture alignment
-    let apply_visual_offset = |ecef: DVec3| -> Vec3 {
-        let offset_rad = settings.texture_lon_offset.to_radians() as f64;
-        let rotated_x = ecef.x * offset_rad.cos() - ecef.z * offset_rad.sin();
-        let rotated_z = ecef.x * offset_rad.sin() + ecef.z * offset_rad.cos();
-        Vec3::new(rotated_x as f32, ecef.y as f32, rotated_z as f32)
-    };
-
     // Target Markers
     // Tehran - RED
     let tehran = geodetic_to_ecef(35.6892, 51.3890, 0.0);
-    gizmos.sphere(apply_visual_offset(tehran), 50000.0, bevy::color::palettes::css::RED);
+    gizmos.sphere(tehran.as_vec3(), 50000.0, bevy::color::palettes::css::RED);
 
     // Radar Stations
     if settings.show_radar_coverage {
         for radar in radar_query.iter() {
             // Draw radar station
-            gizmos.sphere(apply_visual_offset(radar.position_ecef), 75000.0, bevy::color::palettes::css::BLUE);
+            gizmos.sphere(radar.position_ecef.as_vec3(), 75000.0, bevy::color::palettes::css::BLUE);
         }
     }
 
     // Defended Zones
     for zone in defended_zones.iter() {
-        let p_vec = apply_visual_offset(zone.position_ecef);
+        let p_vec = zone.position_ecef.as_vec3();
         let up = p_vec.normalize();
         
         // Draw the zone origin point
@@ -818,7 +810,7 @@ fn trajectory_system(
     // Active Interceptors
     for abm in interceptor_query.iter() {
         // Draw the interceptor tracking marker
-        gizmos.sphere(apply_visual_offset(abm.position_ecef), 40_000.0, bevy::color::palettes::css::LIME);
+        gizmos.sphere(abm.position_ecef.as_vec3(), 40_000.0, bevy::color::palettes::css::LIME);
     }
 
     // Impact Prediction (CEP Scatter Visualization)
@@ -828,7 +820,7 @@ fn trajectory_system(
         // Draw individual prediction points in the swarm
         for p in &prediction.coordinates_ecef {
             centroid += *p;
-            gizmos.sphere(apply_visual_offset(*p), 15000.0, bevy::color::palettes::css::ORANGE);
+            gizmos.sphere(p.as_vec3(), 15000.0, bevy::color::palettes::css::ORANGE);
         }
         
         centroid /= prediction.coordinates_ecef.len() as f64;
@@ -844,7 +836,7 @@ fn trajectory_system(
         let cep_radius = distances[distances.len() / 2];
         
         // Draw the CEP boundary circle
-        let p_vec = apply_visual_offset(centroid);
+        let p_vec = centroid.as_vec3();
         let up = p_vec.normalize();
         let right = up.cross(Vec3::Y).normalize_or_zero();
         let fwd = up.cross(right).normalize_or_zero();
@@ -886,8 +878,7 @@ fn trajectory_system(
     }
 
     for missile in query.iter() {
-        let physical_pos = missile.position_ecef.as_vec3();
-        let pos = apply_visual_offset(missile.position_ecef);
+        let pos = missile.position_ecef.as_vec3();
         let head_color = match missile.phase {
             FlightPhase::Boost => bevy::color::palettes::css::YELLOW,
             FlightPhase::Ballistic => bevy::color::palettes::css::AQUA,
@@ -903,9 +894,6 @@ fn trajectory_system(
                 let (p1, phase1) = missile.path[i];
                 let (p2, _phase2) = missile.path[i+1];
                 
-                let p1_offset = apply_visual_offset(DVec3::new(p1.x as f64, p1.y as f64, p1.z as f64));
-                let p2_offset = apply_visual_offset(DVec3::new(p2.x as f64, p2.y as f64, p2.z as f64));
-                
                 let color = match phase1 {
                     FlightPhase::Boost => bevy::color::palettes::css::YELLOW,
                     FlightPhase::Ballistic => bevy::color::palettes::css::AQUA,
@@ -913,19 +901,17 @@ fn trajectory_system(
                     FlightPhase::Landed => bevy::color::palettes::css::GREEN,
                 };
                 
-                gizmos.line(p1_offset, p2_offset, color);
+                gizmos.line(p1, p2, color);
             }
             // Line to current position
             if let Some((last_pos, last_phase)) = missile.path.last() {
-                let p_last = apply_visual_offset(DVec3::new(last_pos.x as f64, last_pos.y as f64, last_pos.z as f64));
-                
                 let color = match last_phase {
                     FlightPhase::Boost => bevy::color::palettes::css::YELLOW,
                     FlightPhase::Ballistic => bevy::color::palettes::css::AQUA,
                     FlightPhase::ReEntry => bevy::color::palettes::css::RED,
                     FlightPhase::Landed => bevy::color::palettes::css::GREEN,
                 };
-                gizmos.line(p_last, pos, color);
+                gizmos.line(*last_pos, pos, color);
             }
         }
     }
@@ -1069,7 +1055,7 @@ fn egui_stats_system(
     time: Res<Time>,
     window_query: Query<&Window, With<bevy::window::PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
-    settings: Res<SimulationSettings>,
+    _settings: Res<SimulationSettings>,
     active_specs: Res<ActiveMissileSpecs>,
 ) {
     // Avoid panics on first frames if egui isn't
@@ -1133,18 +1119,12 @@ fn egui_stats_system(
                             if t > 0.0 {
                                 let hit_point = origin + dir * t;
                                 
-                                // Adjust for texture offset to get visual lat/lon
-                                let ecef_pos = DVec3::new(hit_point.x as f64, hit_point.y as f64, hit_point.z as f64);
-                                
-                                // The visual texture is rotated by texture_lon_offset
-                                let offset_rad = (-settings.texture_lon_offset).to_radians() as f64; 
-                                let rotated_x = ecef_pos.x * offset_rad.cos() - ecef_pos.z * offset_rad.sin();
-                                let rotated_z = ecef_pos.x * offset_rad.sin() + ecef_pos.z * offset_rad.cos();
-                                
                                 // Standard ECEF to Lat/Lon
+                                let ecef_pos = DVec3::new(hit_point.x as f64, hit_point.y as f64, hit_point.z as f64);
                                 let r = ecef_pos.length();
                                 let lat = (ecef_pos.y / r).asin().to_degrees();
-                                let lon = rotated_x.atan2(rotated_z).to_degrees();
+                                // We use z.atan2(x) because z=sin(lon), x=cos(lon).
+                                let lon = ecef_pos.z.atan2(ecef_pos.x).to_degrees();
                                 
                                 let lat_str = if lat >= 0.0 { format!("{:.4}° N", lat) } else { format!("{:.4}° S", -lat) };
                                 let lon_str = if lon >= 0.0 { format!("{:.4}° E", lon) } else { format!("{:.4}° W", -lon) };
@@ -1183,20 +1163,4 @@ fn spawn_default_missile(commands: &mut Commands, active_specs: &ActiveMissileSp
         path: Vec::new(),
         model: Box::new(BallisticMissilePhysics::new(specs)),
     });
-}
-
-fn earth_alignment_system(
-    settings: Res<SimulationSettings>,
-    mut query: Query<&mut Transform, With<Earth>>,
-) {
-    if settings.is_changed() {
-        for mut transform in query.iter_mut() {
-            transform.rotation = Quat::from_rotation_y(settings.texture_lon_offset.to_radians()) * 
-            Quat::from_mat3(&bevy::math::Mat3::from_cols(
-                Vec3::new(0.0, 0.0, -1.0),
-                Vec3::new(-1.0, 0.0, 0.0),
-                Vec3::new(0.0, 1.0, 0.0),
-            ));
-        }
-    }
 }
