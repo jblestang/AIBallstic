@@ -1,7 +1,7 @@
 mod missiles;
 
 use bevy::prelude::*;
-use bevy_egui::{egui, EguiContexts, EguiPlugin};
+use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use glam::{DVec3, Vec3};
 use nalgebra::{SMatrix, SVector};
 use std::f32::consts::PI;
@@ -44,6 +44,9 @@ struct SimulationSettings {
 
 #[derive(Resource)]
 pub struct ActiveMissileSpecs(pub MissileSpecs);
+
+#[derive(Resource)]
+pub struct MissileRegistry(pub Vec<MissileSpecs>);
 
 // Radar Tracking Resources
 #[derive(Resource, Default)]
@@ -144,6 +147,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
         .add_plugins(EguiPlugin::default())
+        .insert_resource(MissileRegistry(registry))
         .insert_resource(ActiveMissileSpecs(selected_specs))
         .insert_resource(SimulationSettings { 
             time_scale: 10.0, 
@@ -162,15 +166,11 @@ fn main() {
         .init_resource::<MissileFlightHistory>()
         .init_resource::<ABMLaunchQueue>()
         .add_systems(Startup, setup)
+        .add_systems(EguiPrimaryContextPass, egui_stats_system)
         .add_systems(Update, (
-            egui_stats_system,
-            (
-                physics_system, trajectory_system, camera_system, input_system, 
-                solar_lighting_system, radar_scan_system, impact_prediction_system, earth_alignment_system
-            ).after(egui_stats_system),
-            (
-                abm_c2_system, spawn_abm_system, abm_guidance_system, abm_kill_system, explosion_system
-            ).after(egui_stats_system),
+            physics_system, trajectory_system, camera_system, input_system, 
+            solar_lighting_system, radar_scan_system, impact_prediction_system, earth_alignment_system,
+            abm_c2_system, spawn_abm_system, abm_guidance_system, abm_kill_system, explosion_system,
         ))
         .run();
 }
@@ -478,6 +478,29 @@ fn radar_scan_system(
                     tracked_state.velocity_ecef = Some(DVec3::new(final_x[3], final_x[4], final_x[5]));
                 }
             }
+        }
+    }
+}
+
+fn compute_ideal_delta_v(specs: &MissileSpecs) -> f64 {
+    if specs.is_multistage() {
+        let mut total_dv = 0.0;
+        let mut current_mass = specs.total_mass();
+        for stage in &specs.stages {
+            let m_after_burn = current_mass - stage.fuel_mass;
+            if m_after_burn > 0.0 && current_mass > 0.0 {
+                total_dv += stage.isp_vacuum * G0 * (current_mass / m_after_burn).ln();
+            }
+            current_mass = m_after_burn - stage.dry_mass;
+        }
+        total_dv
+    } else {
+        let m0 = specs.dry_mass + specs.fuel_mass;
+        let mf = specs.dry_mass;
+        if mf > 0.0 && m0 > 0.0 {
+            specs.isp_vacuum * G0 * (m0 / mf).ln()
+        } else {
+            0.0
         }
     }
 }
@@ -1104,17 +1127,21 @@ fn egui_stats_system(
     active_specs: Res<ActiveMissileSpecs>,
     error_history: Res<ImpactErrorHistory>,
     flight_history: Res<MissileFlightHistory>,
-) {
-    // Avoid panics on first frames if egui isn't
-    // fully initialized with fonts
+    registry: Res<MissileRegistry>,
+    mut db_initialized: Local<bool>,
+) -> Result {
     if time.elapsed_secs() < 0.2 {
-        return;
+        return Ok(());
     }
-    if let Ok(ctx) = contexts.ctx_mut() {
+    let ctx = contexts.ctx_mut()?;
+    {
         egui::Window::new("AIBallistic Command Center")
-            .fixed_pos([10.0, 10.0])
+            .default_pos([10.0, 10.0])
             .default_width(360.0)
-            .interactable(true)
+            .movable(true)
+            .collapsible(true)
+            .resizable(true)
+            .title_bar(true)
             .show(ctx, |ui| {
                 use egui_plot::{Line, Plot, PlotPoints};
                 ui.style_mut().spacing.button_padding = egui::vec2(10.0, 5.0);
@@ -1225,6 +1252,108 @@ fn egui_stats_system(
                 }
             });
 
+        // --- Missile Database Panel (right side) ---
+        let db_window = egui::Window::new("Missile Database")
+            .default_width(520.0)
+            .movable(true)
+            .collapsible(true)
+            .resizable(true)
+            .title_bar(true);
+        let db_window = if !*db_initialized {
+            *db_initialized = true;
+            db_window.default_pos([ctx.screen_rect().width() - 540.0, 10.0])
+        } else {
+            db_window
+        };
+        db_window.show(ctx, |ui| {
+                let active_name = active_specs.0.name;
+                egui::ScrollArea::vertical().max_height(600.0).show(ui, |ui| {
+                    egui::Grid::new("missile_db_grid")
+                        .striped(true)
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            // Header
+                            ui.strong("Name");
+                            ui.strong("Type");
+                            ui.strong("Stages");
+                            ui.strong("Total Mass");
+                            ui.strong("Payload");
+                            ui.strong("Burn (s)");
+                            ui.strong("Isp vac");
+                            ui.strong("ΔV ideal");
+                            ui.end_row();
+
+                            for specs in &registry.0 {
+                                let is_active = specs.name == active_name;
+                                let label = if is_active {
+                                    egui::RichText::new(specs.name).strong().color(egui::Color32::from_rgb(100, 255, 150))
+                                } else {
+                                    egui::RichText::new(specs.name)
+                                };
+                                ui.label(label);
+
+                                let missile_type = if specs.is_multistage() {
+                                    if specs.stages.len() == 2 { "MRBM" } else { "ICBM" }
+                                } else if specs.total_mass() > 20000.0 {
+                                    "IRBM"
+                                } else if specs.total_mass() > 8000.0 {
+                                    "MRBM"
+                                } else {
+                                    "SRBM"
+                                };
+                                ui.label(missile_type);
+
+                                let n_stages = if specs.is_multistage() {
+                                    format!("{}", specs.stages.len())
+                                } else {
+                                    "1".into()
+                                };
+                                ui.label(n_stages);
+
+                                ui.label(format!("{:.0} kg", specs.total_mass()));
+                                ui.label(format!("{:.0} kg", specs.dry_mass));
+                                ui.label(format!("{:.0}", specs.total_burn_time()));
+
+                                let isp_vac = if specs.is_multistage() {
+                                    let sum: f64 = specs.stages.iter().map(|s| s.isp_vacuum).sum();
+                                    sum / specs.stages.len() as f64
+                                } else {
+                                    specs.isp_vacuum
+                                };
+                                ui.label(format!("{:.0} s", isp_vac));
+
+                                let delta_v = compute_ideal_delta_v(specs);
+                                ui.label(format!("{:.0} m/s", delta_v));
+
+                                ui.end_row();
+                            }
+                        });
+                });
+
+                ui.separator();
+                // Expanded detail for active missile
+                ui.strong(format!("Active: {}", active_name));
+                let s = &active_specs.0;
+                if s.is_multistage() {
+                    for (i, stage) in s.stages.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "  Stage {}: fuel {:.0} kg, struct {:.0} kg, burn {:.0}s, Isp {:.0}/{:.0}s",
+                                i + 1, stage.fuel_mass, stage.dry_mass, stage.burn_time,
+                                stage.isp_sea_level, stage.isp_vacuum
+                            ));
+                        });
+                    }
+                    ui.label(format!("  RV/Payload: {:.0} kg | Area: {:.2} m²", s.dry_mass, s.area));
+                } else {
+                    ui.label(format!(
+                        "  Fuel: {:.0} kg | Dry: {:.0} kg | Burn: {:.0}s | Isp {:.0}/{:.0}s | Area: {:.2} m²",
+                        s.fuel_mass, s.dry_mass, s.burn_time,
+                        s.isp_sea_level, s.isp_vacuum, s.area
+                    ));
+                }
+            });
+
         // Mouse Cursor Raycast Tooltip
         let mut cursor_geo_text = "Cursor: Off Earth".to_string();
 
@@ -1272,6 +1401,7 @@ fn egui_stats_system(
             }
         }
     }
+    Ok(())
 }
 
 fn spawn_default_missile(commands: &mut Commands, active_specs: &ActiveMissileSpecs) {

@@ -71,9 +71,13 @@ pub struct MissileSpecs {
     pub pitch_start_time: f32,
     pub pitch_turn_rate: f64,
     pub boost_loft_factor: f64,
+    #[serde(default = "default_pitch_exponent")]
+    pub pitch_exponent: f64,
     #[serde(default)]
     pub stages: Vec<StageSpecs>,
 }
+
+fn default_pitch_exponent() -> f64 { 1.0 }
 
 impl MissileSpecs {
     pub fn is_multistage(&self) -> bool {
@@ -214,7 +218,8 @@ impl PhysicsModel for BallisticMissilePhysics {
             let pitch_factor = if timer < self.specs.pitch_start_time {
                 0.0
             } else {
-                ((timer - self.specs.pitch_start_time) / (total_bt - self.specs.pitch_start_time)).min(1.0) as f64
+                let linear = ((timer - self.specs.pitch_start_time) / (total_bt - self.specs.pitch_start_time)).min(1.0) as f64;
+                linear.powf(self.specs.pitch_exponent)
             };
             
             let current_thrust_dir = (up * (self.specs.boost_loft_factor - pitch_factor * self.specs.pitch_turn_rate) 
