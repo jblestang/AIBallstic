@@ -58,6 +58,18 @@ struct TrackedMissileState {
 #[derive(Resource, Default)]
 struct ImpactPrediction {
     pub coordinates_ecef: Vec<DVec3>,
+    pub centroid_ecef: Option<DVec3>,
+}
+
+#[derive(Resource, Default)]
+struct ImpactErrorHistory {
+    pub data: Vec<[f64; 2]>,
+}
+
+#[derive(Resource, Default)]
+struct MissileFlightHistory {
+    pub velocity: Vec<[f64; 2]>,
+    pub altitude: Vec<[f64; 2]>,
 }
 
 #[derive(Component)]
@@ -146,6 +158,8 @@ fn main() {
         })
         .init_resource::<TrackedMissileState>()
         .init_resource::<ImpactPrediction>()
+        .init_resource::<ImpactErrorHistory>()
+        .init_resource::<MissileFlightHistory>()
         .init_resource::<ABMLaunchQueue>()
         .add_systems(Startup, setup)
         .add_systems(Update, (
@@ -173,6 +187,8 @@ fn setup(
         Mesh3d(meshes.add(Sphere::new(EARTH_RADIUS as f32).mesh().uv(128, 64))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color_texture: Some(asset_server.load("earth_day_texture.jpg")),
+            emissive: bevy::color::Color::srgb(4.0, 3.5, 2.5).into(),
+            emissive_texture: Some(asset_server.load("earth_night_texture.jpg")),
             unlit: false,
             ..default()
         })),
@@ -187,13 +203,15 @@ fn setup(
     // Light (Sun)
     commands.spawn((
         DirectionalLight {
-            illuminance: 12000.0,
+            illuminance: 50000.0,
             shadows_enabled: true,
             ..default()
         },
         Transform::from_xyz(4.0 * EARTH_RADIUS as f32, 0.0, 2.0 * EARTH_RADIUS as f32).looking_at(Vec3::ZERO, Vec3::Y),
         Sun
     ));
+
+
 
     // Radar Station (E.g., Romania / Deveselu for Aegis Ashore, or generic European location)
     // Let's place it somewhere in Europe to track the Tehran->Moscow flight.
@@ -238,6 +256,7 @@ fn physics_system(
     time: Res<Time>,
     settings: Res<SimulationSettings>,
     mut query: Query<&mut Missile>,
+    mut flight_history: ResMut<MissileFlightHistory>,
 ) {
     let dt = time.delta_secs() * settings.time_scale;
 
@@ -309,11 +328,16 @@ fn physics_system(
         missile.position_ecef += vel * dt as f64;
         
         // --- 4. Trajectory Tracking ---
-        // Sample points for the 3D drawing system.
         if missile.timer % 1.0 < dt { 
             let pos = missile.position_ecef;
             let phase = missile.phase;
             missile.path.push((pos.as_vec3(), phase));
+
+            let alt_km = (pos.length() - EARTH_RADIUS) / 1000.0;
+            let speed_ms = vel.length();
+            let t = missile.timer as f64;
+            flight_history.altitude.push([t, alt_km]);
+            flight_history.velocity.push([t, speed_ms]);
         }
     }
 }
@@ -457,12 +481,69 @@ fn radar_scan_system(
     }
 }
 
+fn compute_ballistic_impact(
+    start_pos: DVec3,
+    start_vel: DVec3,
+    settings: &SimulationSettings,
+    est_mass: f64,
+    est_area: f64,
+) -> DVec3 {
+    let dt: f32 = 1.0;
+    let mut pos = start_pos;
+    let mut vel = start_vel;
+    let mut predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
+    let mut iterations = 0;
+
+    while predicted_alt > 0.0 && iterations < 5000 {
+        iterations += 1;
+        let r = pos.length();
+        let altitude = (r - EARTH_RADIUS).max(0.0);
+
+        let gravity_dir = -pos.normalize();
+        let gravity_accel = gravity_dir * (GRAVITY_CONSTANT / (r * r));
+
+        let coriolis_accel = if settings.coriolis_enabled {
+            -2.0 * EARTH_OMEGA.cross(vel)
+        } else {
+            DVec3::ZERO
+        };
+
+        let centrifugal_accel = if settings.centrifugal_enabled {
+            -EARTH_OMEGA.cross(EARTH_OMEGA.cross(pos))
+        } else {
+            DVec3::ZERO
+        };
+
+        let (rho, sound_speed, _) = get_isa_properties(altitude);
+        let speed = vel.length();
+        let mach = speed / sound_speed;
+        let cd = get_mach_drag(mach);
+
+        let drag_force = -0.5 * rho * (speed * speed) * cd * est_area;
+        let drag_accel = if speed > 1e-3 {
+            (vel.normalize() * drag_force) / est_mass
+        } else {
+            DVec3::ZERO
+        };
+
+        let total_accel = gravity_accel + coriolis_accel + centrifugal_accel + drag_accel;
+
+        vel += total_accel * dt as f64;
+        pos += vel * dt as f64;
+
+        predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
+    }
+
+    pos
+}
+
 fn impact_prediction_system(
     tracked_state: Res<TrackedMissileState>,
     mut prediction: ResMut<ImpactPrediction>,
     settings: Res<SimulationSettings>,
+    missile_query: Query<&Missile>,
+    mut error_history: ResMut<ImpactErrorHistory>,
 ) {
-    // Only run the prediction if the EKF state has been updated.
     if !tracked_state.is_changed() || tracked_state.ekf_state.is_none() {
         return;
     }
@@ -471,78 +552,71 @@ fn impact_prediction_system(
     let base_pos = DVec3::new(ekf[0], ekf[1], ekf[2]);
     let base_vel = DVec3::new(ekf[3], ekf[4], ekf[5]);
     
-    // Clear previous predictions
     prediction.coordinates_ecef.clear();
     
     let n_simulations = 50;
     use rand::Rng;
+    use rand_distr::{Distribution, StandardNormal};
     let mut rng = rand::thread_rng();
 
+    // Use EKF covariance to generate properly correlated state perturbations.
+    // Cholesky decomposition: P = L * L^T, then sample x_perturbed = x_ekf + L * z
+    // where z ~ N(0, I). This ensures the Monte Carlo scatter reflects the actual
+    // tracking uncertainty from radar noise, not arbitrary hardcoded values.
+    let cholesky_l = tracked_state.ekf_covariance
+        .and_then(|p| p.cholesky())
+        .map(|c| c.unpack());
+
     for _ in 0..n_simulations {
-        // Fast-forward fixed time-step simulation
-        let dt: f32 = 1.0; 
-        
-        // Inject per-trajectory variance to build a scatter plot.
-        // E.g., slightly different atmospheric responses or RV estimations.
-        let mut pos = base_pos + DVec3::new(
-            rng.gen_range(-500.0..500.0),
-            rng.gen_range(-500.0..500.0),
-            rng.gen_range(-500.0..500.0)
-        );
-        let mut vel = base_vel + DVec3::new(
-            rng.gen_range(-10.0..10.0),
-            rng.gen_range(-10.0..10.0),
-            rng.gen_range(-10.0..10.0)
-        );
-        
-        // Randomize the Ballistic Coefficient bounds
-        let est_mass = rng.gen_range(400.0..600.0); // RV mass between 400kg - 600kg
-        let est_area = rng.gen_range(0.4..0.6);   // RV cross-section
-        
-        let mut predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
-        let mut iterations = 0; 
-        
-        while predicted_alt > 0.0 && iterations < 5000 {
-            iterations += 1;
-            let r = pos.length();
-            let altitude = (r - EARTH_RADIUS).max(0.0);
-            
-            let gravity_dir = -pos.normalize();
-            let gravity_accel = gravity_dir * (GRAVITY_CONSTANT / (r * r));
+        let (perturbed_pos, perturbed_vel) = if let Some(l) = &cholesky_l {
+            let z = SVector::<f64, 6>::from_fn(|_, _| StandardNormal.sample(&mut rng));
+            let dx = l * z;
+            (
+                base_pos + DVec3::new(dx[0], dx[1], dx[2]),
+                base_vel + DVec3::new(dx[3], dx[4], dx[5]),
+            )
+        } else {
+            // Fallback if covariance is not available or not positive-definite
+            (
+                base_pos + DVec3::new(
+                    rng.gen_range(-500.0..500.0),
+                    rng.gen_range(-500.0..500.0),
+                    rng.gen_range(-500.0..500.0),
+                ),
+                base_vel + DVec3::new(
+                    rng.gen_range(-10.0..10.0),
+                    rng.gen_range(-10.0..10.0),
+                    rng.gen_range(-10.0..10.0),
+                ),
+            )
+        };
 
-            let coriolis_accel = if settings.coriolis_enabled {
-                -2.0 * EARTH_OMEGA.cross(vel)
-            } else {
-                DVec3::ZERO
-            };
-            
-            let centrifugal_accel = if settings.centrifugal_enabled {
-                -EARTH_OMEGA.cross(EARTH_OMEGA.cross(pos))
-            } else {
-                DVec3::ZERO
-            };
+        let est_mass = rng.gen_range(400.0..600.0);
+        let est_area = rng.gen_range(0.4..0.6);
+        
+        let impact = compute_ballistic_impact(perturbed_pos, perturbed_vel, &settings, est_mass, est_area);
+        prediction.coordinates_ecef.push(impact);
+    }
 
-            let (rho, sound_speed, _) = get_isa_properties(altitude);
-            let speed = vel.length();
-            let mach = speed / sound_speed;
-            let cd = get_mach_drag(mach);
-            
-            let drag_force = -0.5 * rho * (speed * speed) * cd * est_area;
-            let drag_accel = if speed > 1e-3 {
-                (vel.normalize() * drag_force) / est_mass
-            } else {
-                DVec3::ZERO
-            };
-
-            let total_accel = gravity_accel + coriolis_accel + centrifugal_accel + drag_accel;
-            
-            vel += total_accel * dt as f64;
-            pos += vel * dt as f64;
-            
-            predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
+    if !prediction.coordinates_ecef.is_empty() {
+        let mut centroid = DVec3::ZERO;
+        for p in &prediction.coordinates_ecef {
+            centroid += *p;
         }
-        
-        prediction.coordinates_ecef.push(pos);
+        centroid /= prediction.coordinates_ecef.len() as f64;
+        prediction.centroid_ecef = Some(centroid);
+
+        if let Some(missile) = missile_query.iter().next() {
+            let true_impact = compute_ballistic_impact(
+                missile.position_ecef,
+                missile.velocity_ecef,
+                &settings,
+                500.0,
+                0.5,
+            );
+            let error_km = centroid.distance(true_impact) / 1000.0;
+            error_history.data.push([missile.timer as f64, error_km]);
+        }
     }
 }
 
@@ -748,29 +822,6 @@ fn trajectory_system(
     prediction: Res<ImpactPrediction>,
     settings: Res<SimulationSettings>,
 ) {
-    // Draw Meridians (Longitude lines every 15 degrees)
-    for lon in (0..360).step_by(15) {
-        let lon_rad = (lon as f32).to_radians();
-        let normal = Vec3::new(lon_rad.sin(), 0.0, -lon_rad.cos());
-        gizmos.circle(
-            Isometry3d::new(Vec3::ZERO, Quat::from_rotation_arc(Vec3::Z, normal)),
-            EARTH_RADIUS as f32 * 1.002, // Slightly above surface
-            bevy::color::Color::srgba(1.0, 1.0, 1.0, 0.4),
-        );
-    }
-    
-    // Draw Parallels (Latitude lines every 15 degrees)
-    for lat in (-75..=75).step_by(15) {
-        let lat_rad = (lat as f32).to_radians();
-        let center_y = EARTH_RADIUS as f32 * lat_rad.sin();
-        let radius = EARTH_RADIUS as f32 * lat_rad.cos();
-        gizmos.circle(
-            Isometry3d::new(Vec3::new(0.0, center_y, 0.0), Quat::from_rotation_arc(Vec3::Z, Vec3::Y)),
-            radius * 1.002,
-            bevy::color::Color::srgba(1.0, 1.0, 1.0, 0.4),
-        );
-    }
-
     // Target Markers
     // Tehran - RED
     let tehran = geodetic_to_ecef(35.6892, 51.3890, 0.0);
@@ -1050,6 +1101,8 @@ fn egui_stats_system(
     camera_query: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
     _settings: Res<SimulationSettings>,
     active_specs: Res<ActiveMissileSpecs>,
+    error_history: Res<ImpactErrorHistory>,
+    flight_history: Res<MissileFlightHistory>,
 ) {
     // Avoid panics on first frames if egui isn't
     // fully initialized with fonts
@@ -1057,77 +1110,154 @@ fn egui_stats_system(
         return;
     }
     if let Ok(ctx) = contexts.ctx_mut() {
-        egui::Window::new("AIBallistic Command Center 🚀")
+        egui::Window::new("AIBallistic Command Center")
             .fixed_pos([10.0, 10.0])
-            .default_width(320.0)
+            .default_width(360.0)
             .interactable(true)
             .show(ctx, |ui| {
+                use egui_plot::{Line, Plot, PlotPoints};
                 ui.style_mut().spacing.button_padding = egui::vec2(10.0, 5.0);
-                
+
                 if let Some((_entity, missile)) = missile_query.iter().next() {
                     let moscow_ecef = geodetic_to_ecef(MOSCOW_LAT, MOSCOW_LON, 0.0);
                     let dist_to_target = missile.position_ecef.distance(moscow_ecef) / 1000.0;
                     let dist_from_start = missile.position_ecef.distance(missile.start_position_ecef) / 1000.0;
-                    
-                    ui.vertical(|ui| {
-                        ui.heading(format!("Model: {}", missile.model.name()));
-                        ui.heading(format!("Phase: {:?}", missile.phase));
-                        ui.separator();
-                        ui.label(format!("Flight Time: {:.1} s", missile.timer));
-                        
-                        for (label, value) in missile.model.get_stats(missile.position_ecef, missile.velocity_ecef, missile.timer) {
-                            ui.label(format!("{}: {}", label, value));
-                        }
 
-                        ui.separator();
-                        ui.label(format!("Distance from Start: {:.1} km", dist_from_start));
-                        ui.label(format!("Distance to Target: {:.1} km", dist_to_target));
-                    });
+                    ui.heading(format!("Model: {}", missile.model.name()));
+                    ui.heading(format!("Phase: {:?}", missile.phase));
+                    ui.separator();
+                    ui.label(format!("Flight Time: {:.1} s", missile.timer));
 
+                    for (label, value) in missile.model.get_stats(missile.position_ecef, missile.velocity_ecef, missile.timer) {
+                        ui.label(format!("{}: {}", label, value));
+                    }
+
+                    ui.separator();
+                    ui.label(format!("Distance from Start: {:.1} km", dist_from_start));
+                    ui.label(format!("Distance to Target: {:.1} km", dist_to_target));
                 } else {
                     ui.label("No missile active.");
                     if ui.button("Spawn Missile").clicked() {
                         spawn_default_missile(&mut commands, &active_specs);
                     }
                 }
+
+                ui.separator();
+
+                // --- Impact Prediction Error ---
+                ui.strong("Impact Prediction Error");
+                if error_history.data.is_empty() {
+                    ui.label("Waiting for radar tracking data...");
+                } else {
+                    let last = error_history.data.last().unwrap();
+                    ui.label(format!("Error: {:.1} km  (t = {:.0} s)", last[1], last[0]));
+
+                    let points: PlotPoints = error_history.data.iter().copied().collect();
+                    let line = Line::new("Prediction Error", points)
+                        .color(egui::Color32::from_rgb(255, 100, 50));
+
+                    Plot::new("impact_error_plot")
+                        .height(200.0)
+                        .x_axis_label("t (s)")
+                        .y_axis_label("km")
+                        .allow_drag(false)
+                        .allow_zoom(false)
+                        .allow_scroll(false)
+                        .allow_boxed_zoom(false)
+                        .show(ui, |plot_ui| {
+                            plot_ui.line(line);
+                        });
+                }
+
+                ui.separator();
+
+                // --- Velocity ---
+                ui.strong("Velocity");
+                if flight_history.velocity.is_empty() {
+                    ui.label("Waiting for flight data...");
+                } else {
+                    let last = flight_history.velocity.last().unwrap();
+                    ui.label(format!("{:.0} m/s  (Mach {:.1})", last[1], last[1] / 343.0));
+
+                    let points: PlotPoints = flight_history.velocity.iter().copied().collect();
+                    let line = Line::new("Velocity", points)
+                        .color(egui::Color32::from_rgb(100, 200, 255));
+
+                    Plot::new("velocity_plot")
+                        .height(200.0)
+                        .x_axis_label("t (s)")
+                        .y_axis_label("m/s")
+                        .allow_drag(false)
+                        .allow_zoom(false)
+                        .allow_scroll(false)
+                        .allow_boxed_zoom(false)
+                        .show(ui, |plot_ui| {
+                            plot_ui.line(line);
+                        });
+                }
+
+                ui.separator();
+
+                // --- Altitude ---
+                ui.strong("Altitude");
+                if flight_history.altitude.is_empty() {
+                    ui.label("Waiting for flight data...");
+                } else {
+                    let last = flight_history.altitude.last().unwrap();
+                    ui.label(format!("{:.1} km", last[1]));
+
+                    let points: PlotPoints = flight_history.altitude.iter().copied().collect();
+                    let line = Line::new("Altitude", points)
+                        .color(egui::Color32::from_rgb(100, 255, 150));
+
+                    Plot::new("altitude_plot")
+                        .height(200.0)
+                        .x_axis_label("t (s)")
+                        .y_axis_label("km")
+                        .allow_drag(false)
+                        .allow_zoom(false)
+                        .allow_scroll(false)
+                        .allow_boxed_zoom(false)
+                        .show(ui, |plot_ui| {
+                            plot_ui.line(line);
+                        });
+                }
             });
 
         // Mouse Cursor Raycast Tooltip
         let mut cursor_geo_text = "Cursor: Off Earth".to_string();
-        
+
         if let Some(window) = window_query.iter().next() {
             if let Some(cursor_pos) = window.cursor_position() {
                 if let Some((camera, camera_transform)) = camera_query.iter().next() {
                     if let Ok(ray) = camera.viewport_to_world(camera_transform, cursor_pos) {
                         let origin = ray.origin;
                         let dir = *ray.direction;
-                        
+
                         let a: f32 = dir.length_squared();
                         let b: f32 = 2.0 * origin.dot(dir);
                         let c: f32 = origin.length_squared() - (EARTH_RADIUS * EARTH_RADIUS) as f32;
-                        
+
                         let discriminant: f32 = b * b - 4.0 * a * c;
                         if discriminant >= 0.0 {
                             let t = (-b - discriminant.sqrt()) / (2.0 * a);
                             if t > 0.0 {
                                 let hit_point = origin + dir * t;
-                                
-                                // Standard ECEF to Lat/Lon
+
                                 let ecef_pos = DVec3::new(hit_point.x as f64, hit_point.y as f64, hit_point.z as f64);
                                 let r = ecef_pos.length();
                                 let lat = (ecef_pos.y / r).asin().to_degrees();
-                                // We use (-z).atan2(x) because z= -sin(lon), x=cos(lon).
                                 let lon = (-ecef_pos.z).atan2(ecef_pos.x).to_degrees();
-                                
+
                                 let lat_str = if lat >= 0.0 { format!("{:.4}° N", lat) } else { format!("{:.4}° S", -lat) };
                                 let lon_str = if lon >= 0.0 { format!("{:.4}° E", lon) } else { format!("{:.4}° W", -lon) };
-                                
+
                                 cursor_geo_text = format!("{}, {}", lat_str, lon_str);
                             }
                         }
                     }
                 }
-                
+
                 if cursor_geo_text != "Cursor: Off Earth" {
                     egui::Area::new(egui::Id::new("cursor_tooltip"))
                         .fixed_pos(egui::pos2(cursor_pos.x + 15.0, cursor_pos.y + 15.0))

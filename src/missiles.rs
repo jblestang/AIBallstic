@@ -162,16 +162,14 @@ impl PhysicsModel for BallisticMissilePhysics {
         
         if phase == FlightPhase::Boost {
             let target_dir = (self.target_ecef - position).normalize();
-            let up = position.normalize(); // Gravity turn initial vector
+            let up = position.normalize();
             
-            // Pitch factor controls the gravity turn profile over time.
             let pitch_factor = if timer < self.specs.pitch_start_time {
                 0.0
             } else {
                 ((timer - self.specs.pitch_start_time) / (self.specs.burn_time - self.specs.pitch_start_time)).min(1.0) as f64
             };
             
-            // Blends the "up" vector with the "target" direction to simulate pitching over.
             let current_thrust_dir = (up * (self.specs.boost_loft_factor - pitch_factor * self.specs.pitch_turn_rate) 
                 + target_dir * (pitch_factor * self.specs.pitch_turn_rate)).normalize();
             
