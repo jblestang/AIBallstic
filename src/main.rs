@@ -72,6 +72,7 @@ struct ImpactErrorHistory {
 #[derive(Resource, Default)]
 struct MissileFlightHistory {
     pub velocity: Vec<[f64; 2]>,
+    pub mach: Vec<[f64; 2]>,
     pub altitude: Vec<[f64; 2]>,
 }
 
@@ -334,11 +335,15 @@ fn physics_system(
             let phase = missile.phase;
             missile.path.push((pos.as_vec3(), phase));
 
-            let alt_km = (pos.length() - EARTH_RADIUS) / 1000.0;
+            let altitude_m = (pos.length() - EARTH_RADIUS).max(0.0);
+            let alt_km = altitude_m / 1000.0;
             let speed_ms = vel.length();
+            let (_, sound_speed, _) = get_isa_properties(altitude_m);
+            let mach = speed_ms / sound_speed;
             let t = missile.timer as f64;
             flight_history.altitude.push([t, alt_km]);
             flight_history.velocity.push([t, speed_ms]);
+            flight_history.mach.push([t, mach]);
         }
     }
 }
@@ -1204,8 +1209,9 @@ fn egui_stats_system(
                 if flight_history.velocity.is_empty() {
                     ui.label("Waiting for flight data...");
                 } else {
-                    let last = flight_history.velocity.last().unwrap();
-                    ui.label(format!("{:.0} m/s  (Mach {:.1})", last[1], last[1] / 343.0));
+                    let last_v = flight_history.velocity.last().unwrap();
+                    let last_m = flight_history.mach.last().map(|m| m[1]).unwrap_or(0.0);
+                    ui.label(format!("{:.0} m/s  (Mach {:.1})", last_v[1], last_m));
 
                     let points: PlotPoints = flight_history.velocity.iter().copied().collect();
                     let line = Line::new("Velocity", points)
