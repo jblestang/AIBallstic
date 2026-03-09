@@ -125,11 +125,11 @@ fn main() {
         return;
     }
 
-    let mut selected_specs = registry.first().copied().expect("Missile registry is empty!");
+    let mut selected_specs = registry.first().cloned().expect("Missile registry is empty!");
     if let Some(pos) = args.iter().position(|arg| arg == "--missile" || arg == "-m") {
         if let Some(target_name) = args.get(pos + 1) {
             if let Some(specs) = registry.iter().find(|s| s.name.to_lowercase().contains(&target_name.to_lowercase())) {
-                selected_specs = *specs;
+                selected_specs = specs.clone();
                 println!("✅ Selected missile: {}", selected_specs.name);
             } else {
                 println!("❌ Missile '{}' not found. Available:", target_name);
@@ -231,13 +231,14 @@ fn setup(
     // Launch from TEHRAN, IR
     // Geodetic: 35.6892° N, 51.3890° E
     let tehran_ecef = geodetic_to_ecef(35.6892, 51.3890, 10.0);
-    let specs = active_specs.0;
+    let specs = active_specs.0.clone();
+    let initial_mass = specs.total_mass();
     
     commands.spawn(Missile {
         position_ecef: tehran_ecef,
         start_position_ecef: tehran_ecef,
         velocity_ecef: DVec3::ZERO,
-        mass: specs.dry_mass + specs.fuel_mass,
+        mass: initial_mass,
         timer: 0.0,
         phase: FlightPhase::Boost,
         path: Vec::new(),
@@ -1275,12 +1276,13 @@ fn egui_stats_system(
 
 fn spawn_default_missile(commands: &mut Commands, active_specs: &ActiveMissileSpecs) {
     let tehran_ecef = geodetic_to_ecef(35.6892, 51.3890, 10.0);
-    let specs = active_specs.0;
+    let specs = active_specs.0.clone();
+    let initial_mass = specs.total_mass();
     commands.spawn(Missile {
         position_ecef: tehran_ecef,
         start_position_ecef: tehran_ecef,
         velocity_ecef: DVec3::ZERO,
-        mass: specs.dry_mass + specs.fuel_mass,
+        mass: initial_mass,
         timer: 0.0,
         phase: FlightPhase::Boost,
         path: Vec::new(),

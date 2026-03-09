@@ -51,6 +51,15 @@ pub const MOSCOW_LON: f64 = 37.6173;
 // --- Missile Specification Structure ---
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct StageSpecs {
+    pub dry_mass: f64,
+    pub fuel_mass: f64,
+    pub burn_time: f32,
+    pub isp_sea_level: f64,
+    pub isp_vacuum: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissileSpecs {
     pub name: &'static str,
     pub dry_mass: f64,
@@ -60,13 +69,50 @@ pub struct MissileSpecs {
     pub isp_sea_level: f64,
     pub isp_vacuum: f64,
     pub pitch_start_time: f32,
-    pub pitch_turn_rate: f64, // Factor for mixing target dir
-    pub boost_loft_factor: f64, // Elevation bias during boost
+    pub pitch_turn_rate: f64,
+    pub boost_loft_factor: f64,
+    #[serde(default)]
+    pub stages: Vec<StageSpecs>,
 }
 
 impl MissileSpecs {
+    pub fn is_multistage(&self) -> bool {
+        !self.stages.is_empty()
+    }
+
+    pub fn total_mass(&self) -> f64 {
+        if self.is_multistage() {
+            self.dry_mass + self.stages.iter().map(|s| s.dry_mass + s.fuel_mass).sum::<f64>()
+        } else {
+            self.dry_mass + self.fuel_mass
+        }
+    }
+
+    pub fn total_burn_time(&self) -> f32 {
+        if self.is_multistage() {
+            self.stages.iter().map(|s| s.burn_time).sum()
+        } else {
+            self.burn_time
+        }
+    }
+
     pub fn burn_rate(&self) -> f64 {
         self.fuel_mass / self.burn_time as f64
+    }
+
+    pub fn active_stage(&self, timer: f32) -> Option<(usize, &StageSpecs, f32)> {
+        let mut elapsed = 0.0f32;
+        for (i, stage) in self.stages.iter().enumerate() {
+            if timer < elapsed + stage.burn_time {
+                return Some((i, stage, timer - elapsed));
+            }
+            elapsed += stage.burn_time;
+        }
+        None
+    }
+
+    pub fn stage_end_time(&self, stage_idx: usize) -> f32 {
+        self.stages[..=stage_idx].iter().map(|s| s.burn_time).sum()
     }
 }
 
@@ -145,14 +191,12 @@ impl PhysicsModel for BallisticMissilePhysics {
         let mach = speed / sound_speed;
 
         // --- 2. Flight Phase Determination ---
-        let phase = if timer < self.specs.burn_time {
+        let total_bt = self.specs.total_burn_time();
+        let phase = if timer < total_bt {
             FlightPhase::Boost
         } else if altitude > 120000.0 || velocity.dot(position) >= 0.0 {
-            // Ballistic phase applies when out of the atmosphere (120km, Karman line+) 
-            // or while still moving upwards (dot product of velocity and position is positive).
             FlightPhase::Ballistic
         } else {
-            // Re-entry begins when below 120km and descending.
             FlightPhase::ReEntry
         };
 
@@ -161,34 +205,45 @@ impl PhysicsModel for BallisticMissilePhysics {
         let mut mass_delta = 0.0;
         
         if phase == FlightPhase::Boost {
-            let target_dir = (self.target_ecef - position).normalize();
             let up = position.normalize();
+            let target_vec = self.target_ecef - position;
+            // Project target direction onto local horizontal plane (remove vertical component)
+            // to prevent thrusting downward when at high altitude above the target.
+            let horizontal_dir = (target_vec - up * up.dot(target_vec)).normalize();
             
             let pitch_factor = if timer < self.specs.pitch_start_time {
                 0.0
             } else {
-                ((timer - self.specs.pitch_start_time) / (self.specs.burn_time - self.specs.pitch_start_time)).min(1.0) as f64
+                ((timer - self.specs.pitch_start_time) / (total_bt - self.specs.pitch_start_time)).min(1.0) as f64
             };
             
             let current_thrust_dir = (up * (self.specs.boost_loft_factor - pitch_factor * self.specs.pitch_turn_rate) 
-                + target_dir * (pitch_factor * self.specs.pitch_turn_rate)).normalize();
+                + horizontal_dir * (pitch_factor * self.specs.pitch_turn_rate)).normalize();
             
-            // Dynamic Specific Impulse (Isp) based on atmospheric pressure.
-            // Rocket engines become more efficient in a vacuum as exhaust expansion is unimpeded.
-            // Equation: Isp_current = Isp_vac - (Isp_vac - Isp_sl) * (P_current / P0)
-            // [Reference: https://en.wikipedia.org/wiki/Specific_impulse#Altitude_dependence]
             let p_ratio = (pressure / P0).clamp(0.0, 1.0);
-            let current_isp = self.specs.isp_vacuum - (self.specs.isp_vacuum - self.specs.isp_sea_level) * p_ratio;
-            
-            let burn_rate = self.specs.burn_rate();
-            // Tsiolkovsky Rocket Equation component: Thrust = m_dot * Isp * g0
-            let thrust_force = burn_rate * current_isp * G0;
 
-            // Newton's Second Law: a = F/m
-            thrust_accel = current_thrust_dir * (thrust_force / mass);
-            
-            // Mass decreases over time by the burn rate (kg/s).
-            mass_delta = -burn_rate * dt as f64;
+            if self.specs.is_multistage() {
+                if let Some((_stage_idx, stage, _time_in_stage)) = self.specs.active_stage(timer) {
+                    let burn_rate = stage.fuel_mass / stage.burn_time as f64;
+                    let current_isp = stage.isp_vacuum - (stage.isp_vacuum - stage.isp_sea_level) * p_ratio;
+                    let thrust_force = burn_rate * current_isp * G0;
+                    thrust_accel = current_thrust_dir * (thrust_force / mass);
+                    mass_delta = -burn_rate * dt as f64;
+                }
+                // Stage jettison: check if any stage boundary is crossed during this dt
+                for (i, stage) in self.specs.stages.iter().enumerate() {
+                    let end_t = self.specs.stage_end_time(i);
+                    if timer < end_t && timer + dt >= end_t {
+                        mass_delta -= stage.dry_mass;
+                    }
+                }
+            } else {
+                let current_isp = self.specs.isp_vacuum - (self.specs.isp_vacuum - self.specs.isp_sea_level) * p_ratio;
+                let burn_rate = self.specs.burn_rate();
+                let thrust_force = burn_rate * current_isp * G0;
+                thrust_accel = current_thrust_dir * (thrust_force / mass);
+                mass_delta = -burn_rate * dt as f64;
+            }
         }
 
         // --- 4. Aerodynamic Drag Calculations ---
@@ -215,20 +270,36 @@ impl PhysicsModel for BallisticMissilePhysics {
         let speed = velocity.length();
         let mach = speed / sound_speed;
         let p_ratio = (pressure / P0).clamp(0.0, 1.0);
-        let (current_isp_str, p_ratio_str) = if timer < self.specs.burn_time {
-            let current_isp = self.specs.isp_vacuum - (self.specs.isp_vacuum - self.specs.isp_sea_level) * p_ratio;
-            (format!("{:.1} s", current_isp), format!("{:.4}", p_ratio))
+
+        let total_bt = self.specs.total_burn_time();
+        let (current_isp_str, p_ratio_str, stage_str) = if timer < total_bt {
+            if self.specs.is_multistage() {
+                if let Some((idx, stage, _)) = self.specs.active_stage(timer) {
+                    let isp = stage.isp_vacuum - (stage.isp_vacuum - stage.isp_sea_level) * p_ratio;
+                    (format!("{:.1} s", isp), format!("{:.4}", p_ratio),
+                     format!("{}/{}", idx + 1, self.specs.stages.len()))
+                } else {
+                    ("N/A".into(), "N/A".into(), "N/A".into())
+                }
+            } else {
+                let isp = self.specs.isp_vacuum - (self.specs.isp_vacuum - self.specs.isp_sea_level) * p_ratio;
+                (format!("{:.1} s", isp), format!("{:.4}", p_ratio), "1/1".into())
+            }
         } else {
-            ("N/A".into(), "N/A".into())
+            ("N/A".into(), "N/A".into(), "N/A".into())
         };
 
-        vec![
+        let mut stats = vec![
             ("Altitude".into(), format!("{:.2} km", altitude / 1000.0)),
             ("Mach".into(), format!("{:.2}", mach)),
             ("Speed".into(), format!("{:.0} m/s", speed)),
             ("Isp".into(), current_isp_str),
             ("Pressure Ratio".into(), p_ratio_str),
-        ]
+        ];
+        if self.specs.is_multistage() {
+            stats.push(("Stage".into(), stage_str));
+        }
+        stats
     }
 }
 // ============================================================================
