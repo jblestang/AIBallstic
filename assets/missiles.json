@@ -104,7 +104,17 @@
       { "dry_mass": 2400.0, "fuel_mass": 20800.0, "burn_time": 60.0, "isp_sea_level": 237.0, "isp_vacuum": 263.0 },
       { "dry_mass": 1200.0, "fuel_mass": 6100.0, "burn_time": 60.0, "isp_sea_level": 274.0, "isp_vacuum": 295.0 },
       { "dry_mass": 300.0, "fuel_mass": 3400.0, "burn_time": 55.0, "isp_sea_level": 280.0, "isp_vacuum": 300.0 }
-    ]
+    ],
+    "mirv": {
+      "num_warheads": 3,
+      "warhead_mass": 270.0,
+      "warhead_area": 0.3,
+      "num_decoys": 6,
+      "decoy_mass": 5.0,
+      "decoy_area": 0.3,
+      "deploy_delay": 20.0,
+      "spread_velocity": 150.0
+    }
   },
   {
     "name": "UGM-133 Trident II (USA/UK)",
@@ -122,7 +132,17 @@
       { "dry_mass": 3000.0, "fuel_mass": 30000.0, "burn_time": 65.0, "isp_sea_level": 262.0, "isp_vacuum": 290.0 },
       { "dry_mass": 1500.0, "fuel_mass": 14000.0, "burn_time": 55.0, "isp_sea_level": 278.0, "isp_vacuum": 305.0 },
       { "dry_mass": 700.0, "fuel_mass": 7000.0, "burn_time": 40.0, "isp_sea_level": 282.0, "isp_vacuum": 318.0 }
-    ]
+    ],
+    "mirv": {
+      "num_warheads": 8,
+      "warhead_mass": 360.0,
+      "warhead_area": 0.35,
+      "num_decoys": 12,
+      "decoy_mass": 4.0,
+      "decoy_area": 0.35,
+      "deploy_delay": 15.0,
+      "spread_velocity": 200.0
+    }
   },
   {
     "name": "M51 SLBM (France)",
@@ -140,7 +160,17 @@
       { "dry_mass": 2800.0, "fuel_mass": 26200.0, "burn_time": 65.0, "isp_sea_level": 260.0, "isp_vacuum": 285.0 },
       { "dry_mass": 1500.0, "fuel_mass": 12000.0, "burn_time": 55.0, "isp_sea_level": 275.0, "isp_vacuum": 300.0 },
       { "dry_mass": 800.0, "fuel_mass": 6200.0, "burn_time": 45.0, "isp_sea_level": 280.0, "isp_vacuum": 315.0 }
-    ]
+    ],
+    "mirv": {
+      "num_warheads": 6,
+      "warhead_mass": 300.0,
+      "warhead_area": 0.3,
+      "num_decoys": 10,
+      "decoy_mass": 4.5,
+      "decoy_area": 0.3,
+      "deploy_delay": 18.0,
+      "spread_velocity": 180.0
+    }
   },
   {
     "name": "Agni-V (India)",
@@ -158,7 +188,17 @@
       { "dry_mass": 3000.0, "fuel_mass": 27000.0, "burn_time": 70.0, "isp_sea_level": 250.0, "isp_vacuum": 272.0 },
       { "dry_mass": 1800.0, "fuel_mass": 11200.0, "burn_time": 65.0, "isp_sea_level": 268.0, "isp_vacuum": 290.0 },
       { "dry_mass": 800.0, "fuel_mass": 4700.0, "burn_time": 55.0, "isp_sea_level": 275.0, "isp_vacuum": 300.0 }
-    ]
+    ],
+    "mirv": {
+      "num_warheads": 4,
+      "warhead_mass": 250.0,
+      "warhead_area": 0.28,
+      "num_decoys": 8,
+      "decoy_mass": 5.0,
+      "decoy_area": 0.28,
+      "deploy_delay": 20.0,
+      "spread_velocity": 160.0
+    }
   },
   {
     "name": "Hwasong-18 (North Korea)",
@@ -176,7 +216,17 @@
       { "dry_mass": 3500.0, "fuel_mass": 29500.0, "burn_time": 70.0, "isp_sea_level": 252.0, "isp_vacuum": 278.0 },
       { "dry_mass": 1800.0, "fuel_mass": 12700.0, "burn_time": 65.0, "isp_sea_level": 268.0, "isp_vacuum": 295.0 },
       { "dry_mass": 1000.0, "fuel_mass": 6000.0, "burn_time": 55.0, "isp_sea_level": 275.0, "isp_vacuum": 308.0 }
-    ]
+    ],
+    "mirv": {
+      "num_warheads": 3,
+      "warhead_mass": 300.0,
+      "warhead_area": 0.3,
+      "num_decoys": 5,
+      "decoy_mass": 5.0,
+      "decoy_area": 0.3,
+      "deploy_delay": 20.0,
+      "spread_velocity": 140.0
+    }
   },
   {
     "name": "DF-41 (China)",
@@ -194,7 +244,17 @@
       { "dry_mass": 3800.0, "fuel_mass": 44200.0, "burn_time": 65.0, "isp_sea_level": 265.0, "isp_vacuum": 295.0 },
       { "dry_mass": 2000.0, "fuel_mass": 18500.0, "burn_time": 65.0, "isp_sea_level": 280.0, "isp_vacuum": 310.0 },
       { "dry_mass": 1000.0, "fuel_mass": 8000.0, "burn_time": 55.0, "isp_sea_level": 285.0, "isp_vacuum": 320.0 }
-    ]
+    ],
+    "mirv": {
+      "num_warheads": 10,
+      "warhead_mass": 250.0,
+      "warhead_area": 0.28,
+      "num_decoys": 15,
+      "decoy_mass": 3.5,
+      "decoy_area": 0.28,
+      "deploy_delay": 15.0,
+      "spread_velocity": 250.0
+    }
   },
   {
     "name": "DF-17 (China)",

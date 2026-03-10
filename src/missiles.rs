@@ -75,9 +75,23 @@ pub struct MissileSpecs {
     pub pitch_exponent: f64,
     #[serde(default)]
     pub stages: Vec<StageSpecs>,
+    #[serde(default)]
+    pub mirv: Option<MirvConfig>,
 }
 
 fn default_pitch_exponent() -> f64 { 1.0 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct MirvConfig {
+    pub num_warheads: u32,
+    pub warhead_mass: f64,
+    pub warhead_area: f64,
+    pub num_decoys: u32,
+    pub decoy_mass: f64,
+    pub decoy_area: f64,
+    pub deploy_delay: f32,
+    pub spread_velocity: f64,
+}
 
 impl MissileSpecs {
     pub fn is_multistage(&self) -> bool {

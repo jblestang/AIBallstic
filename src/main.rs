@@ -11,6 +11,20 @@ use chrono::{Datelike, Timelike, Utc};
 // Constants
 // Real-world alignment is handled in missiles.rs constants
 
+struct SafeDespawn(Entity);
+
+impl bevy::ecs::system::Command for SafeDespawn {
+    fn apply(self, world: &mut World) {
+        if let Ok(e) = world.get_entity_mut(self.0) {
+            e.despawn();
+        }
+    }
+}
+
+fn safe_despawn(commands: &mut Commands, entity: Entity) {
+    commands.queue(SafeDespawn(entity));
+}
+
 #[derive(Component)]
 pub struct Missile {
     pub position_ecef: DVec3,
@@ -114,6 +128,29 @@ struct Explosion {
     pub max_time: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReentryBodyType {
+    Warhead,
+    Decoy,
+}
+
+#[derive(Component)]
+pub struct ReentryBody {
+    pub body_type: ReentryBodyType,
+    pub position_ecef: DVec3,
+    pub velocity_ecef: DVec3,
+    pub mass: f64,
+    pub area: f64,
+    pub path: Vec<(Vec3, ReentryBodyType)>,
+    pub phase: FlightPhase,
+    pub parent_missile: Option<Entity>,
+}
+
+#[derive(Resource, Default)]
+struct MirvDeploymentTracker {
+    deployed_missiles: Vec<Entity>,
+}
+
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -166,12 +203,14 @@ fn main() {
         .init_resource::<ImpactErrorHistory>()
         .init_resource::<MissileFlightHistory>()
         .init_resource::<ABMLaunchQueue>()
+        .init_resource::<MirvDeploymentTracker>()
         .add_systems(Startup, setup)
         .add_systems(EguiPrimaryContextPass, egui_stats_system)
         .add_systems(Update, (
             physics_system, trajectory_system, camera_system, input_system, 
             solar_lighting_system, radar_scan_system, impact_prediction_system, earth_alignment_system,
             abm_c2_system, spawn_abm_system, abm_guidance_system, abm_kill_system, explosion_system,
+            mirv_deployment_system, reentry_body_physics_system,
         ))
         .run();
 }
@@ -214,18 +253,30 @@ fn setup(
 
 
 
-    // Radar Station (E.g., Romania / Deveselu for Aegis Ashore, or generic European location)
-    // Let's place it somewhere in Europe to track the Tehran->Moscow flight.
-    // Coordinates: 44.07, 24.31 (Deveselu, Romania)
+    // Radar Station placed 1000 km south of Moscow (bearing south).
+    // (Used for tracking the Tehran->Moscow flight in this scenario.)
+    let (radar_lat, radar_lon) = destination_point(55.7558, 37.6173, 180.0, 1_000_000.0);
     commands.spawn(RadarStation {
-        position_ecef: geodetic_to_ecef(44.07, 24.31, 100.0),
+        position_ecef: geodetic_to_ecef(radar_lat, radar_lon, 100.0),
         range: 5_000_000.0, // 5000 km
         scan_timer: 0.0,
     });
 
-    // Defended Zone (Moscow)
+    // Defended Zone (ABM site) placed 500 km south of Moscow, then 100 km to the south-east, then 100 km east, then 100 km south-east.
+    let (adm_lat0, adm_lon0) = destination_point(55.7558, 37.6173, 180.0, 500_000.0);
+    let (adm_lat, adm_lon) = destination_point(adm_lat0, adm_lon0, 135.0, 100_000.0);
+
     commands.spawn(DefendedZone {
-        position_ecef: geodetic_to_ecef(55.7558, 37.6173, 0.0),
+        position_ecef: geodetic_to_ecef(adm_lat, adm_lon, 0.0),
+        radius: 300_000.0, // 300 km point-defense radius
+    });
+
+    // Additional Defended Zone: 200 km east of Moscow, then +100 km south-east, then +100 km south-east again
+    let (moscow_abm_lat0, moscow_abm_lon0) = destination_point(MOSCOW_LAT, MOSCOW_LON, 90.0, 200_000.0);
+    let (moscow_abm_lat1, moscow_abm_lon1) = destination_point(moscow_abm_lat0, moscow_abm_lon0, 135.0, 100_000.0);
+    let (moscow_abm_lat, moscow_abm_lon) = destination_point(moscow_abm_lat1, moscow_abm_lon1, 135.0, 100_000.0);
+    commands.spawn(DefendedZone {
+        position_ecef: geodetic_to_ecef(moscow_abm_lat, moscow_abm_lon, 0.0),
         radius: 300_000.0, // 300 km point-defense radius
     });
 
@@ -583,7 +634,7 @@ fn impact_prediction_system(
     
     prediction.coordinates_ecef.clear();
     
-    let n_simulations = 50;
+    let n_simulations = 100;
     use rand::Rng;
     use rand_distr::{Distribution, StandardNormal};
     let mut rng = rand::thread_rng();
@@ -658,11 +709,11 @@ fn abm_c2_system(
     prediction: Res<ImpactPrediction>,
     defended_zones: Query<&DefendedZone>,
     missile_query: Query<(Entity, &Missile)>,
+    reentry_query: Query<(Entity, &ReentryBody)>,
     interceptor_query: Query<&ABMInterceptor>,
 ) {
     if prediction.coordinates_ecef.is_empty() { return; }
     
-    // Determine the centroid of the swarm
     let mut centroid = DVec3::ZERO;
     for &pt in &prediction.coordinates_ecef {
         centroid += pt;
@@ -670,28 +721,40 @@ fn abm_c2_system(
     centroid /= prediction.coordinates_ecef.len() as f64;
     
     for zone in defended_zones.iter() {
-        if centroid.distance(zone.position_ecef) <= zone.radius {
-            // Threat calculated to land within defended zone!
-            
-            for (missile_entity, missile) in missile_query.iter() {
-                if missile.phase == FlightPhase::Landed { continue; }
-                
-                // Do not launch if there is already an active interceptor
-                let mut already_targeted = false;
-                for int in interceptor_query.iter() {
-                    if int.target_entity == missile_entity { already_targeted = true; break; }
-                }
-                if already_targeted { continue; }
-                
-                // Only launch if the target is within 500km of the defended zone
-                let dist_to_zone = missile.position_ecef.distance(zone.position_ecef);
-                if dist_to_zone < 500_000.0 {
-                    let battery_pos = zone.position_ecef + (zone.position_ecef.normalize() * 100.0); // Surface launch
-                    launch_queue.0.push(SpawnABMEvent {
-                        target_entity: missile_entity,
-                        battery_pos,
-                    });
-                }
+        if centroid.distance(zone.position_ecef) > zone.radius { continue; }
+
+        // Collect all threat entities (missiles + reentry bodies)
+        let mut threats: Vec<(Entity, DVec3, bool)> = Vec::new();
+
+        for (entity, missile) in missile_query.iter() {
+            if missile.phase == FlightPhase::Landed { continue; }
+            threats.push((entity, missile.position_ecef, true));
+        }
+
+        for (entity, body) in reentry_query.iter() {
+            if body.phase == FlightPhase::Landed { continue; }
+            // During reentry, decoys decelerate faster → discriminated
+            // Only engage decoys if still in mid-course (Ballistic phase)
+            let dominated_by_drag = body.phase == FlightPhase::ReEntry
+                && body.body_type == ReentryBodyType::Decoy;
+            if dominated_by_drag { continue; }
+            threats.push((entity, body.position_ecef, false));
+        }
+
+        for (threat_entity, threat_pos, _is_missile) in &threats {
+            let mut already_targeted = false;
+            for int in interceptor_query.iter() {
+                if int.target_entity == *threat_entity { already_targeted = true; break; }
+            }
+            if already_targeted { continue; }
+
+            let dist_to_zone = threat_pos.distance(zone.position_ecef);
+            if dist_to_zone < 500_000.0 {
+                let battery_pos = zone.position_ecef + (zone.position_ecef.normalize() * 100.0);
+                launch_queue.0.push(SpawnABMEvent {
+                    target_entity: *threat_entity,
+                    battery_pos,
+                });
             }
         }
     }
@@ -732,61 +795,64 @@ fn abm_guidance_system(
     mut commands: Commands,
     mut interceptor_query: Query<(Entity, &mut ABMInterceptor, &mut Transform)>,
     missile_query: Query<(Entity, &Missile)>,
+    reentry_query: Query<(Entity, &ReentryBody)>,
     tracked_state: Res<TrackedMissileState>,
 ) {
     let dt = time.delta_secs() * settings.time_scale;
     
     for (int_ent, mut abm, mut transform) in interceptor_query.iter_mut() {
-        let target_opt = missile_query.iter().find(|(e, _)| *e == abm.target_entity);
-        if let Some((_, target_missile)) = target_opt {
-            
-            if target_missile.phase == FlightPhase::Landed {
-                commands.entity(int_ent).despawn();
-                continue;
-            }
-            
-            // Proportional Navigation
-            let target_pos = tracked_state.position_ecef.unwrap_or(target_missile.position_ecef);
-            let target_vel = tracked_state.velocity_ecef.unwrap_or(target_missile.velocity_ecef);
-            
-            let los = target_pos - abm.position_ecef;
-            let los_dist = los.length();
-            if los_dist < 1.0 { continue; } 
-            let los_dir = los.normalize();
-            
-            let rel_vel = target_vel - abm.velocity_ecef;
-            let closing_vel = -rel_vel.dot(los_dir);
-            
-            let los_rate_vector = los_dir.cross(rel_vel) / los_dist;
-            
-            let mut accel = DVec3::ZERO;
-            if closing_vel > 0.0 {
-                accel = abm.navigation_gain * closing_vel * los_rate_vector.cross(los_dir);
-                if accel.length() > abm.max_g_load {
-                    accel = accel.normalize() * abm.max_g_load;
+        // Find target among missiles or reentry bodies
+        let target_state: Option<(DVec3, DVec3, bool)> = 
+            if let Some((_, m)) = missile_query.iter().find(|(e, _)| *e == abm.target_entity) {
+                if m.phase == FlightPhase::Landed { None }
+                else {
+                    let tp = tracked_state.position_ecef.unwrap_or(m.position_ecef);
+                    let tv = tracked_state.velocity_ecef.unwrap_or(m.velocity_ecef);
+                    Some((tp, tv, false))
                 }
+            } else if let Some((_, b)) = reentry_query.iter().find(|(e, _)| *e == abm.target_entity) {
+                if b.phase == FlightPhase::Landed { None }
+                else { Some((b.position_ecef, b.velocity_ecef, false)) }
+            } else {
+                None
+            };
+
+        let Some((target_pos, target_vel, _)) = target_state else {
+            safe_despawn(&mut commands, int_ent);
+            continue;
+        };
+
+        let los = target_pos - abm.position_ecef;
+        let los_dist = los.length();
+        if los_dist < 1.0 { continue; } 
+        let los_dir = los.normalize();
+        
+        let rel_vel = target_vel - abm.velocity_ecef;
+        let closing_vel = -rel_vel.dot(los_dir);
+        let los_rate_vector = los_dir.cross(rel_vel) / los_dist;
+        
+        let mut accel = DVec3::ZERO;
+        if closing_vel > 0.0 {
+            accel = abm.navigation_gain * closing_vel * los_rate_vector.cross(los_dir);
+            if accel.length() > abm.max_g_load {
+                accel = accel.normalize() * abm.max_g_load;
             }
-            
-            // Gravity
-            let r = abm.position_ecef.length();
-            let gravity = -abm.position_ecef.normalize() * (GRAVITY_CONSTANT / (r * r));
-            accel += gravity;
-            
-            // Thrust
-            let speed = abm.velocity_ecef.length();
-            if speed < 5000.0 {
-                let thrust_dir = if speed > 1.0 { abm.velocity_ecef.normalize() } else { los_dir };
-                accel += thrust_dir * (30.0 * 9.81); 
-            }
-            
-            abm.velocity_ecef += accel * dt as f64;
-            let delta = abm.velocity_ecef * dt as f64;
-            abm.position_ecef += delta;
-            transform.translation = abm.position_ecef.as_vec3();
-            
-        } else {
-            commands.entity(int_ent).despawn();
         }
+        
+        let r = abm.position_ecef.length();
+        let gravity = -abm.position_ecef.normalize() * (GRAVITY_CONSTANT / (r * r));
+        accel += gravity;
+        
+        let speed = abm.velocity_ecef.length();
+        if speed < 5000.0 {
+            let thrust_dir = if speed > 1.0 { abm.velocity_ecef.normalize() } else { los_dir };
+            accel += thrust_dir * (30.0 * 9.81); 
+        }
+        
+        abm.velocity_ecef += accel * dt as f64;
+        let vel_step = abm.velocity_ecef * dt as f64;
+        abm.position_ecef += vel_step;
+        transform.translation = abm.position_ecef.as_vec3();
     }
 }
 
@@ -794,30 +860,40 @@ fn abm_kill_system(
     mut commands: Commands,
     interceptor_query: Query<(Entity, &ABMInterceptor)>,
     missile_query: Query<(Entity, &Missile)>,
+    reentry_query: Query<(Entity, &ReentryBody)>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     for (int_ent, abm) in interceptor_query.iter() {
-        if let Ok((missile_ent, missile)) = missile_query.get(abm.target_entity) {
-            let dist = abm.position_ecef.distance(missile.position_ecef);
-            if dist < abm.kill_radius {
-                let alt = (missile.position_ecef.length() - EARTH_RADIUS) / 1000.0;
-                println!("💥 INTERCEPT SUCCESSFUL! Threat neutralized at {:.1} km altitude.", alt);
-                
-                commands.spawn((
-                    Mesh3d(meshes.add(Sphere::new(100_000.0).mesh().uv(32, 16))), 
-                    MeshMaterial3d(materials.add(StandardMaterial {
-                        base_color: bevy::color::Color::srgb(1.0, 0.5, 0.0), // Orange fireball
-                        unlit: true,
-                        ..default()
-                    })),
-                    Transform::from_translation(abm.position_ecef.as_vec3()),
-                    Explosion { timer: 0.0, max_time: 2.0 }
-                ));
-                
-                commands.entity(missile_ent).despawn();
-                commands.entity(int_ent).despawn();
-            }
+        let (target_pos, target_ent) = 
+            if let Ok((e, m)) = missile_query.get(abm.target_entity) {
+                (m.position_ecef, Some(e))
+            } else if let Ok((e, b)) = reentry_query.get(abm.target_entity) {
+                (b.position_ecef, Some(e))
+            } else {
+                safe_despawn(&mut commands, int_ent);
+                continue;
+            };
+
+        let Some(target_ent) = target_ent else { continue; };
+        let dist = abm.position_ecef.distance(target_pos);
+        if dist < abm.kill_radius {
+            let alt = (target_pos.length() - EARTH_RADIUS) / 1000.0;
+            println!("💥 INTERCEPT SUCCESSFUL! Threat neutralized at {:.1} km altitude.", alt);
+            
+            commands.spawn((
+                Mesh3d(meshes.add(Sphere::new(100_000.0).mesh().uv(32, 16))), 
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: bevy::color::Color::srgb(1.0, 0.5, 0.0),
+                    unlit: true,
+                    ..default()
+                })),
+                Transform::from_translation(abm.position_ecef.as_vec3()),
+                Explosion { timer: 0.0, max_time: 2.0 }
+            ));
+            
+            safe_despawn(&mut commands, target_ent);
+            safe_despawn(&mut commands, int_ent);
         }
     }
 }
@@ -830,7 +906,7 @@ fn explosion_system(
     for (e, mut exp, mut transform) in q.iter_mut() {
         exp.timer += time.delta_secs();
         if exp.timer >= exp.max_time {
-            commands.entity(e).despawn();
+            safe_despawn(&mut commands, e);
         } else {
             let scale = 1.0 - (exp.timer / exp.max_time);
             transform.scale = Vec3::splat(scale.max(0.01));
@@ -845,6 +921,7 @@ fn explosion_system(
 fn trajectory_system(
     mut gizmos: Gizmos,
     query: Query<&Missile>,
+    reentry_query: Query<&ReentryBody>,
     radar_query: Query<&RadarStation>,
     defended_zones: Query<&DefendedZone>,
     interceptor_query: Query<&ABMInterceptor>,
@@ -855,6 +932,10 @@ fn trajectory_system(
     // Tehran - RED
     let tehran = geodetic_to_ecef(35.6892, 51.3890, 0.0);
     gizmos.sphere(tehran.as_vec3(), 50000.0, bevy::color::palettes::css::RED);
+
+    // Moscow - PURPLE
+    let moscow = geodetic_to_ecef(MOSCOW_LAT, MOSCOW_LON, 0.0);
+    gizmos.sphere(moscow.as_vec3(), 65000.0, bevy::color::palettes::css::PURPLE);
 
     // Radar Stations
     if settings.show_radar_coverage {
@@ -988,6 +1069,36 @@ fn trajectory_system(
             }
         }
     }
+
+    // Reentry bodies (MIRV warheads & decoys)
+    for body in reentry_query.iter() {
+        let pos = body.position_ecef.as_vec3();
+        if body.phase == FlightPhase::Landed { continue; }
+
+        let (head_color, trail_color, size) = match body.body_type {
+            ReentryBodyType::Warhead => (
+                bevy::color::palettes::css::ORANGE_RED,
+                bevy::color::palettes::css::SALMON,
+                35000.0,
+            ),
+            ReentryBodyType::Decoy => (
+                bevy::color::palettes::css::GOLD,
+                bevy::color::palettes::css::KHAKI,
+                25000.0,
+            ),
+        };
+
+        gizmos.sphere(pos, size, head_color);
+
+        if body.path.len() > 1 {
+            for i in 0..body.path.len() - 1 {
+                gizmos.line(body.path[i].0, body.path[i + 1].0, trail_color);
+            }
+            if let Some((last_pos, _)) = body.path.last() {
+                gizmos.line(*last_pos, pos, trail_color);
+            }
+        }
+    }
 }
 
 fn camera_system(
@@ -1058,6 +1169,27 @@ pub fn geodetic_to_ecef(lat: f64, lon: f64, alt: f64) -> DVec3 {
     )
 }
 
+fn destination_point(lat_deg: f64, lon_deg: f64, bearing_deg: f64, distance_m: f64) -> (f64, f64) {
+    // Great-circle destination point on a sphere.
+    let lat1 = lat_deg.to_radians();
+    let lon1 = lon_deg.to_radians();
+    let brng = bearing_deg.to_radians();
+    let dr = distance_m / EARTH_RADIUS;
+
+    let sin_lat1 = lat1.sin();
+    let cos_lat1 = lat1.cos();
+    let sin_dr = dr.sin();
+    let cos_dr = dr.cos();
+
+    let lat2 = (sin_lat1 * cos_dr + cos_lat1 * sin_dr * brng.cos()).asin();
+    let lon2 = lon1
+        + (brng.sin() * sin_dr * cos_lat1)
+            .atan2(cos_dr - sin_lat1 * lat2.sin());
+
+    let lon2 = ((lon2 + std::f64::consts::PI) % (2.0 * std::f64::consts::PI)) - std::f64::consts::PI;
+    (lat2.to_degrees(), lon2.to_degrees())
+}
+
 
 fn input_system(
     keys: Res<ButtonInput<KeyCode>>,
@@ -1125,6 +1257,7 @@ fn egui_stats_system(
     mut commands: Commands,
     mut contexts: EguiContexts,
     missile_query: Query<(Entity, &Missile)>,
+    reentry_query: Query<(Entity, &ReentryBody)>,
     time: Res<Time>,
     window_query: Query<&Window, With<bevy::window::PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
@@ -1134,6 +1267,7 @@ fn egui_stats_system(
     flight_history: Res<MissileFlightHistory>,
     registry: Res<MissileRegistry>,
     mut db_initialized: Local<bool>,
+    mut mirv_tracker: ResMut<MirvDeploymentTracker>,
 ) -> Result {
     if time.elapsed_secs() < 0.2 {
         return Ok(());
@@ -1171,6 +1305,10 @@ fn egui_stats_system(
                 } else {
                     ui.label("No missile active.");
                     if ui.button("Spawn Missile").clicked() {
+                        for (ent, _) in reentry_query.iter() {
+                            safe_despawn(&mut commands, ent);
+                        }
+                        mirv_tracker.deployed_missiles.clear();
                         spawn_default_missile(&mut commands, &active_specs);
                     }
                 }
@@ -1189,6 +1327,31 @@ fn egui_stats_system(
                     let line = Line::new("Prediction Error", points)
                         .color(egui::Color32::from_rgb(255, 100, 50));
 
+                    // Least-squares linear regression: y = a + b*x
+                    let n = error_history.data.len() as f64;
+                    let (sum_x, sum_y, sum_xx, sum_xy) = error_history.data.iter()
+                        .fold((0.0, 0.0, 0.0, 0.0), |(sx, sy, sxx, sxy), p| {
+                            (sx + p[0], sy + p[1], sxx + p[0] * p[0], sxy + p[0] * p[1])
+                        });
+                    let denom = n * sum_xx - sum_x * sum_x;
+                    let (reg_line, reg_label) = if denom.abs() > 1e-12 && n >= 2.0 {
+                        let b = (n * sum_xy - sum_x * sum_y) / denom;
+                        let a = (sum_y - b * sum_x) / n;
+                        let x0 = error_history.data.first().unwrap()[0];
+                        let x1 = error_history.data.last().unwrap()[0];
+                        let reg_pts: PlotPoints = vec![[x0, a + b * x0], [x1, a + b * x1]].into_iter().collect();
+                        let label = format!("Trend: {:.2} km/s", b);
+                        (Some(Line::new("Linear Regression", reg_pts)
+                            .color(egui::Color32::from_rgb(150, 200, 255))
+                            .style(egui_plot::LineStyle::dashed_dense())), label)
+                    } else {
+                        (None, String::new())
+                    };
+
+                    if !reg_label.is_empty() {
+                        ui.label(reg_label);
+                    }
+
                     Plot::new("impact_error_plot")
                         .height(200.0)
                         .x_axis_label("t (s)")
@@ -1199,6 +1362,9 @@ fn egui_stats_system(
                         .allow_boxed_zoom(false)
                         .show(ui, |plot_ui| {
                             plot_ui.line(line);
+                            if let Some(rl) = reg_line {
+                                plot_ui.line(rl);
+                            }
                         });
                 }
 
@@ -1256,6 +1422,49 @@ fn egui_stats_system(
                             plot_ui.line(line);
                         });
                 }
+
+                // --- MIRV / Decoy Status ---
+                let warheads: Vec<&ReentryBody> = reentry_query.iter()
+                    .map(|(_, b)| b)
+                    .filter(|b| b.body_type == ReentryBodyType::Warhead)
+                    .collect();
+                let decoys: Vec<&ReentryBody> = reentry_query.iter()
+                    .map(|(_, b)| b)
+                    .filter(|b| b.body_type == ReentryBodyType::Decoy)
+                    .collect();
+                let total_rv = warheads.len() + decoys.len();
+
+                if total_rv > 0 || active_specs.0.mirv.is_some() {
+                    ui.separator();
+                    ui.strong("MIRV / Countermeasures");
+
+                    if let Some(cfg) = &active_specs.0.mirv {
+                        ui.label(format!("Config: {} RVs + {} decoys", cfg.num_warheads, cfg.num_decoys));
+                    }
+
+                    if total_rv > 0 {
+                        let active_w = warheads.iter().filter(|b| b.phase != FlightPhase::Landed).count();
+                        let active_d = decoys.iter().filter(|b| b.phase != FlightPhase::Landed).count();
+                        ui.label(format!(
+                            "Active: {} warheads, {} decoys  ({} total objects)",
+                            active_w, active_d, active_w + active_d
+                        ));
+
+                        let reentry_w = warheads.iter().filter(|b| b.phase == FlightPhase::ReEntry).count();
+                        let reentry_d = decoys.iter().filter(|b| b.phase == FlightPhase::ReEntry).count();
+                        if reentry_w + reentry_d > 0 {
+                            ui.label(format!("  Re-entering: {} RV + {} decoys", reentry_w, reentry_d));
+                            if reentry_d > 0 {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 200, 50),
+                                    "Decoys discriminated (drag divergence)"
+                                );
+                            }
+                        }
+                    } else {
+                        ui.label("PBV deployment pending...");
+                    }
+                }
             });
 
         // --- Missile Database Panel (right side) ---
@@ -1278,7 +1487,6 @@ fn egui_stats_system(
                         .striped(true)
                         .spacing([8.0, 4.0])
                         .show(ui, |ui| {
-                            // Header
                             ui.strong("Name");
                             ui.strong("Type");
                             ui.strong("Stages");
@@ -1287,6 +1495,7 @@ fn egui_stats_system(
                             ui.strong("Burn (s)");
                             ui.strong("Isp vac");
                             ui.strong("ΔV ideal");
+                            ui.strong("MIRV");
                             ui.end_row();
 
                             for specs in &registry.0 {
@@ -1331,6 +1540,12 @@ fn egui_stats_system(
                                 let delta_v = compute_ideal_delta_v(specs);
                                 ui.label(format!("{:.0} m/s", delta_v));
 
+                                let mirv_label = match &specs.mirv {
+                                    Some(cfg) => format!("{}+{}", cfg.num_warheads, cfg.num_decoys),
+                                    None => "-".into(),
+                                };
+                                ui.label(mirv_label);
+
                                 ui.end_row();
                             }
                         });
@@ -1356,6 +1571,26 @@ fn egui_stats_system(
                         "  Fuel: {:.0} kg | Dry: {:.0} kg | Burn: {:.0}s | Isp {:.0}/{:.0}s | Area: {:.2} m²",
                         s.fuel_mass, s.dry_mass, s.burn_time,
                         s.isp_sea_level, s.isp_vacuum, s.area
+                    ));
+                }
+
+                if let Some(cfg) = &s.mirv {
+                    ui.separator();
+                    ui.strong("MIRV Configuration");
+                    ui.label(format!(
+                        "  {} warheads ({:.0} kg, {:.2} m²) + {} decoys ({:.1} kg, {:.2} m²)",
+                        cfg.num_warheads, cfg.warhead_mass, cfg.warhead_area,
+                        cfg.num_decoys, cfg.decoy_mass, cfg.decoy_area
+                    ));
+                    ui.label(format!(
+                        "  Deploy delay: {:.0}s post-burnout | Spread ΔV: {:.0} m/s",
+                        cfg.deploy_delay, cfg.spread_velocity
+                    ));
+                    let beta_rv = cfg.warhead_mass / (0.3 * cfg.warhead_area);
+                    let beta_decoy = cfg.decoy_mass / (0.3 * cfg.decoy_area);
+                    ui.label(format!(
+                        "  β(RV): {:.0} kg/m² | β(decoy): {:.0} kg/m²  (ratio {:.0}x)",
+                        beta_rv, beta_decoy, beta_rv / beta_decoy.max(0.1)
                     ));
                 }
             });
@@ -1408,6 +1643,118 @@ fn egui_stats_system(
         }
     }
     Ok(())
+}
+
+fn mirv_deployment_system(
+    mut commands: Commands,
+    missile_query: Query<(Entity, &Missile)>,
+    mut tracker: ResMut<MirvDeploymentTracker>,
+    active_specs: Res<ActiveMissileSpecs>,
+) {
+    let mirv_config = match &active_specs.0.mirv {
+        Some(cfg) => *cfg,
+        None => return,
+    };
+
+    for (entity, missile) in missile_query.iter() {
+        if tracker.deployed_missiles.contains(&entity) { continue; }
+        
+        let total_bt = active_specs.0.total_burn_time();
+        if missile.timer < total_bt + mirv_config.deploy_delay { continue; }
+        if missile.phase == FlightPhase::Landed { continue; }
+
+        tracker.deployed_missiles.push(entity);
+
+        let pos = missile.position_ecef;
+        let vel = missile.velocity_ecef;
+        let up = pos.normalize();
+        let vel_dir = vel.normalize();
+        let side = vel_dir.cross(up).normalize();
+
+        let total_objects = mirv_config.num_warheads + mirv_config.num_decoys;
+        
+        for i in 0..total_objects {
+            let is_warhead = i < mirv_config.num_warheads;
+            let angle = (i as f64 / total_objects as f64) * std::f64::consts::TAU;
+            let spread_dir = (side * angle.cos() + up * angle.sin() * 0.3).normalize();
+            let dv = spread_dir * mirv_config.spread_velocity;
+
+            let (mass, area, body_type) = if is_warhead {
+                (mirv_config.warhead_mass, mirv_config.warhead_area, ReentryBodyType::Warhead)
+            } else {
+                (mirv_config.decoy_mass, mirv_config.decoy_area, ReentryBodyType::Decoy)
+            };
+
+            commands.spawn(ReentryBody {
+                body_type,
+                position_ecef: pos + spread_dir * 100.0,
+                velocity_ecef: vel + dv,
+                mass,
+                area,
+                path: Vec::new(),
+                phase: FlightPhase::Ballistic,
+                parent_missile: Some(entity),
+            });
+        }
+    }
+}
+
+fn reentry_body_physics_system(
+    time: Res<Time>,
+    settings: Res<SimulationSettings>,
+    mut query: Query<&mut ReentryBody>,
+) {
+    let dt = time.delta_secs() * settings.time_scale;
+
+    for mut body in query.iter_mut() {
+        if body.phase == FlightPhase::Landed { continue; }
+
+        let r = body.position_ecef.length();
+        if r < EARTH_RADIUS && body.path.len() > 2 {
+            body.velocity_ecef = DVec3::ZERO;
+            body.phase = FlightPhase::Landed;
+            continue;
+        }
+
+        let gravity_dir = -body.position_ecef.normalize();
+        let gravity_accel = gravity_dir * (GRAVITY_CONSTANT / (r * r));
+
+        let coriolis_accel = if settings.coriolis_enabled {
+            -2.0 * EARTH_OMEGA.cross(body.velocity_ecef)
+        } else { DVec3::ZERO };
+        let centrifugal_accel = if settings.centrifugal_enabled {
+            -EARTH_OMEGA.cross(EARTH_OMEGA.cross(body.position_ecef))
+        } else { DVec3::ZERO };
+
+        let altitude = (r - EARTH_RADIUS).max(0.0);
+        let (rho, sound_speed, _) = get_isa_properties(altitude);
+        let speed = body.velocity_ecef.length();
+        let mach = speed / sound_speed;
+        let cd = get_mach_drag(mach);
+        let drag_force = -0.5 * rho * speed * speed * cd * body.area;
+        let drag_accel = if speed > 1e-3 {
+            (body.velocity_ecef.normalize() * drag_force) / body.mass
+        } else { DVec3::ZERO };
+
+        let phase = if altitude > 120000.0 || body.velocity_ecef.dot(body.position_ecef) >= 0.0 {
+            FlightPhase::Ballistic
+        } else {
+            FlightPhase::ReEntry
+        };
+        body.phase = phase;
+
+        let total_accel = gravity_accel + coriolis_accel + centrifugal_accel + drag_accel;
+        body.velocity_ecef += total_accel * dt as f64;
+        let new_vel = body.velocity_ecef;
+        body.position_ecef += new_vel * dt as f64;
+
+        let pos_vec3 = body.position_ecef.as_vec3();
+        let btype = body.body_type;
+        let should_push = body.path.is_empty() || pos_vec3.distance(body.path.last().unwrap().0) > 10000.0;
+        if should_push {
+            body.path.push((pos_vec3, btype));
+        }
+    }
 }
 
 fn spawn_default_missile(commands: &mut Commands, active_specs: &ActiveMissileSpecs) {
