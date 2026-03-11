@@ -29,7 +29,7 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@2
+        uses: Swatinem/rust-cache@v2
         with:
           key: wasm
 
@@ -53,7 +53,7 @@ jobs:
           cp index.html out/
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@3
+        uses: actions/upload-pages-artifact@v3
         with:
           path: out
 
@@ -63,4 +63,4 @@ jobs:
     environment: github_pages
     steps:
       - name: Deploy to GitHub Pages
-        uses: actions/deploy-pages@4
+        uses: actions/deploy-pages@v4
