@@ -1,6 +1,7 @@
 mod missiles;
 
 use bevy::prelude::*;
+use bevy::window::{Window, WindowPlugin};
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use glam::{DVec3, Vec3};
 use nalgebra::{SMatrix, SVector};
@@ -182,8 +183,20 @@ fn main() {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    let window_plugin = WindowPlugin {
+        primary_window: Some(Window {
+            canvas: Some("#bevy-canvas".into()),
+            fit_canvas_to_parent: true,
+            ..default()
+        }),
+        ..default()
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let window_plugin = WindowPlugin::default();
+
     App::new()
-        .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
+        .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()).set(window_plugin))
         .add_plugins(EguiPlugin::default())
         .insert_resource(MissileRegistry(registry))
         .insert_resource(ActiveMissileSpecs(selected_specs))

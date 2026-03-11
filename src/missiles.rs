@@ -137,11 +137,15 @@ impl MissileSpecs {
 // --- Predefined Missile Specs ---
 
 pub fn get_missile_registry() -> Vec<MissileSpecs> {
-    let json_str = std::fs::read_to_string("assets/missiles.json")
-        .expect("⚠️ Could not read assets/missiles.json");
-    let static_str: &'static str = Box::leak(json_str.into_boxed_str());
-    serde_json::from_str(static_str)
-        .expect("⚠️ Failed to parse assets/missiles.json")
+    #[cfg(target_arch = "wasm32")]
+    let json_str: &'static str = include_str!("../assets/missiles.json");
+    #[cfg(not(target_arch = "wasm32"))]
+    let json_str: &'static str = {
+        let s = std::fs::read_to_string("assets/missiles.json")
+            .expect("⚠️ Could not read assets/missiles.json");
+        Box::leak(s.into_boxed_str())
+    };
+    serde_json::from_str(json_str).expect("⚠️ Failed to parse assets/missiles.json")
 }
 
 // --- Trait & Enum ---

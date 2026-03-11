@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AIBallistic</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a0f; }
+    #bevy-canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+    #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #aaa; font: 18px/1.5 system-ui, sans-serif; text-align: center; }
+  </style>
+</head>
+<body>
+  <canvas id="bevy-canvas" width="1280" height="720"></canvas>
+  <div id="loading">Loading AIBallistic…</div>
+  <script type="module">
+    const loading = document.getElementById('loading');
+    try {
+      const init = (await import('./aiballistic.js')).default;
+      await init();
+      loading.remove();
+    } catch (e) {
+      const msg = e?.message ?? String(e);
+      if (!msg.includes("Using exceptions for control flow")) {
+        loading.textContent = 'Load failed: ' + msg;
+        console.error(e);
+      } else {
+        loading.remove();
+      }
+    }
+  </script>
+</body>
+</html>

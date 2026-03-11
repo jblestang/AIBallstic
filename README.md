@@ -44,6 +44,27 @@ Simply running without arguments launches the default **Khorramshahr-4**:
 cargo run --release
 ```
 
+## 🌐 WebAssembly (WASM)
+
+A GitHub Action (`.github/workflows/deploy-wasm.yml`) builds the WASM app and deploys it to **GitHub Pages** on every push to `main`. Enable it in the repo under **Settings → Pages → Build and deployment → Source**: choose **GitHub Actions**. The live app will be at `https://<user>.github.io/<repo>/`.
+
+You can also build and run locally:
+
+1. **Install wasm-bindgen CLI** (version should match the one in `Cargo.lock`):
+   ```bash
+   cargo install wasm-bindgen-cli
+   ```
+2. **Build and prepare the web output**:
+   ```bash
+   ./build_wasm.sh
+   ```
+   This produces an `out/` folder with the WASM binary, JS glue, assets, and `index.html`.
+3. **Serve the `out/` folder** with any static HTTP server, then open the page:
+   ```bash
+   cd out && python3 -m http.server 8080
+   ```
+   Open **http://localhost:8080** in a modern browser (WebGL2 required).
+
 ## 🕹 Controls
 
 - **Mouse Drag**: Rotate Camera

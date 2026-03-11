@@ -1,0 +1,66 @@
+# Build WASM and deploy to GitHub Pages
+# Enable in repo: Settings > Pages > Source: GitHub Actions
+
+name: Deploy WASM to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@2
+        with:
+          key: wasm
+
+      - name: Build WASM
+        run: cargo build --release --target wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen
+        run: cargo install wasm-bindgen-cli --version 0.2.114
+
+      - name: Run wasm-bindgen
+        run: |
+          mkdir -p out
+          wasm-bindgen --no-typescript --target web \
+            --out-dir out \
+            --out-name aiballistic \
+            target/wasm32-unknown-unknown/release/aiballistic.wasm
+
+      - name: Copy assets and index
+        run: |
+          cp -r assets out/
+          cp index.html out/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@3
+        with:
+          path: out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: github_pages
+    steps:
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@4
