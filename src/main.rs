@@ -394,10 +394,16 @@ fn physics_system(
         missile.position_ecef += vel * dt as f64;
         
         // --- 4. Trajectory Tracking ---
-        if missile.timer % 1.0 < dt { 
+        const MAX_PATH_LEN: usize = 3000;
+        const MAX_HISTORY_LEN: usize = 2500;
+        if missile.timer % 1.0 < dt {
             let pos = missile.position_ecef;
             let phase = missile.phase;
             missile.path.push((pos.as_vec3(), phase));
+            let path_len = missile.path.len();
+            if path_len > MAX_PATH_LEN {
+                missile.path.drain(0..path_len - MAX_PATH_LEN);
+            }
 
             let altitude_m = (pos.length() - EARTH_RADIUS).max(0.0);
             let alt_km = altitude_m / 1000.0;
@@ -408,6 +414,13 @@ fn physics_system(
             flight_history.altitude.push([t, alt_km]);
             flight_history.velocity.push([t, speed_ms]);
             flight_history.mach.push([t, mach]);
+            let hist_len = flight_history.velocity.len();
+            if hist_len > MAX_HISTORY_LEN {
+                let n = hist_len - MAX_HISTORY_LEN;
+                flight_history.altitude.drain(0..n);
+                flight_history.velocity.drain(0..n);
+                flight_history.mach.drain(0..n);
+            }
         }
     }
 }
@@ -586,8 +599,12 @@ fn compute_ballistic_impact(
     let mut vel = start_vel;
     let mut predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
     let mut iterations = 0;
+    #[cfg(target_arch = "wasm32")]
+    const MAX_ITER: usize = 2500;
+    #[cfg(not(target_arch = "wasm32"))]
+    const MAX_ITER: usize = 5000;
 
-    while predicted_alt > 0.0 && iterations < 5000 {
+    while predicted_alt > 0.0 && iterations < MAX_ITER {
         iterations += 1;
         let r = pos.length();
         let altitude = (r - EARTH_RADIUS).max(0.0);
@@ -646,7 +663,11 @@ fn impact_prediction_system(
     let base_vel = DVec3::new(ekf[3], ekf[4], ekf[5]);
     
     prediction.coordinates_ecef.clear();
-    
+
+    // Fewer Monte Carlo runs on WASM to avoid blocking the main thread
+    #[cfg(target_arch = "wasm32")]
+    let n_simulations = 25usize;
+    #[cfg(not(target_arch = "wasm32"))]
     let n_simulations = 100;
     use rand::Rng;
     use rand_distr::{Distribution, StandardNormal};
@@ -709,6 +730,11 @@ fn impact_prediction_system(
             );
             let error_km = centroid.distance(true_impact) / 1000.0;
             error_history.data.push([missile.timer as f64, error_km]);
+            const MAX_ERROR_HISTORY: usize = 500;
+            let len = error_history.data.len();
+            if len > MAX_ERROR_HISTORY {
+                error_history.data.drain(0..len - MAX_ERROR_HISTORY);
+            }
         }
     }
 }
