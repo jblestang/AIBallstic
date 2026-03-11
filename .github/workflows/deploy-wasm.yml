@@ -1,11 +1,19 @@
 # Build WASM and deploy to GitHub Pages
 # Enable in repo: Settings > Pages > Source: GitHub Actions
+# Cargo + rust-cache recompile only changed crates; this workflow runs only when relevant files change.
 
 name: Deploy WASM to GitHub Pages
 
 on:
   push:
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'assets/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'index.html'
+      - '.github/workflows/deploy-wasm.yml'
   workflow_dispatch:
 
 permissions:
@@ -36,6 +44,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: wasm
+        # Cache restores target/ and registry; cargo only recompiles changed crates.
 
       - name: Build WASM
         run: cargo build --release --target wasm32-unknown-unknown
