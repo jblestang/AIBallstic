@@ -91,6 +91,21 @@ struct MissileFlightHistory {
     pub altitude: Vec<[f64; 2]>,
 }
 
+/// On WASM, impact prediction runs only every this many sim seconds to avoid blocking.
+#[cfg(target_arch = "wasm32")]
+const IMPACT_PREDICTION_INTERVAL: f64 = 3.0;
+#[cfg(target_arch = "wasm32")]
+#[derive(Resource, Default)]
+struct LastImpactPredictionTime(pub f64);
+
+/// WASM-only: trail markers (small spheres) for trajectory when Gizmos don't render on web.
+#[cfg(target_arch = "wasm32")]
+#[derive(Component)]
+struct TrailMarker;
+#[cfg(target_arch = "wasm32")]
+#[derive(Resource, Default)]
+struct TrajectoryTrailMarkers(pub Option<Vec<Entity>>);
+
 #[derive(Component)]
 struct RadarStation {
     pub position_ecef: DVec3,
@@ -199,7 +214,8 @@ fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     let window_plugin = WindowPlugin::default();
 
-    App::new()
+    #[cfg(not(target_arch = "wasm32"))]
+    let _app = App::new()
         .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()).set(window_plugin))
         .add_plugins(EguiPlugin::default())
         .insert_resource(MissileRegistry(registry))
@@ -228,6 +244,41 @@ fn main() {
             solar_lighting_system, radar_scan_system, impact_prediction_system, earth_alignment_system,
             abm_c2_system, spawn_abm_system, abm_guidance_system, abm_kill_system, explosion_system,
             mirv_deployment_system, reentry_body_physics_system,
+        ))
+        .run();
+    #[cfg(target_arch = "wasm32")]
+    App::new()
+        .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()).set(window_plugin))
+        .add_plugins(EguiPlugin::default())
+        .insert_resource(MissileRegistry(registry))
+        .insert_resource(ActiveMissileSpecs(selected_specs))
+        .insert_resource(SimulationSettings { 
+            time_scale: 10.0, 
+            rotation_paused: false,
+            zoom_distance: EARTH_RADIUS as f32 * 2.5,
+            theta: 0.0,
+            phi: 0.5, // Slight tilt
+            coriolis_enabled: true,
+            centrifugal_enabled: true,
+            show_radar_coverage: true,
+            texture_lon_offset: 0.0, // Base UV mathematically aligns perfectly
+        })
+        .init_resource::<TrackedMissileState>()
+        .init_resource::<ImpactPrediction>()
+        .init_resource::<ImpactErrorHistory>()
+        .init_resource::<MissileFlightHistory>()
+        .init_resource::<ABMLaunchQueue>()
+        .init_resource::<MirvDeploymentTracker>()
+        .init_resource::<LastImpactPredictionTime>()
+        .init_resource::<TrajectoryTrailMarkers>()
+        .add_systems(Startup, setup)
+        .add_systems(EguiPrimaryContextPass, egui_stats_system)
+        .add_systems(Update, (
+            physics_system, trajectory_system, camera_system, input_system, 
+            solar_lighting_system, radar_scan_system, impact_prediction_system, earth_alignment_system,
+            abm_c2_system, spawn_abm_system, abm_guidance_system, abm_kill_system, explosion_system,
+            mirv_deployment_system, reentry_body_physics_system,
+            wasm_trajectory_trail_system,
         ))
         .run();
 }
@@ -604,7 +655,7 @@ fn compute_ballistic_impact(
     let mut predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
     let mut iterations = 0;
     #[cfg(target_arch = "wasm32")]
-    const MAX_ITER: usize = 2500;
+    const MAX_ITER: usize = 2000;
     #[cfg(not(target_arch = "wasm32"))]
     const MAX_ITER: usize = 5000;
 
@@ -657,11 +708,20 @@ fn impact_prediction_system(
     settings: Res<SimulationSettings>,
     missile_query: Query<&Missile>,
     mut error_history: ResMut<ImpactErrorHistory>,
+    #[cfg(target_arch = "wasm32")] mut last_time: ResMut<LastImpactPredictionTime>,
 ) {
     if !tracked_state.is_changed() || tracked_state.ekf_state.is_none() {
         return;
     }
-    
+    #[cfg(target_arch = "wasm32")]
+    {
+        let t = missile_query.iter().next().map(|m| m.timer as f64).unwrap_or(0.0);
+        if t - last_time.0 < IMPACT_PREDICTION_INTERVAL {
+            return;
+        }
+        last_time.0 = t;
+    }
+
     let ekf = tracked_state.ekf_state.unwrap();
     let base_pos = DVec3::new(ekf[0], ekf[1], ekf[2]);
     let base_vel = DVec3::new(ekf[3], ekf[4], ekf[5]);
@@ -670,7 +730,7 @@ fn impact_prediction_system(
 
     // Fewer Monte Carlo runs on WASM to avoid blocking the main thread
     #[cfg(target_arch = "wasm32")]
-    let n_simulations = 25usize;
+    let n_simulations = 15usize;
     #[cfg(not(target_arch = "wasm32"))]
     let n_simulations = 100;
     use rand::Rng;
@@ -1143,6 +1203,102 @@ fn trajectory_system(
             if let Some((last_pos, _)) = body.path.last() {
                 gizmos.line(*last_pos, pos, trail_color);
             }
+        }
+    }
+}
+
+/// WASM: draw trajectory as small spheres so the track is visible when Gizmos don't render on web.
+#[cfg(target_arch = "wasm32")]
+fn wasm_trajectory_trail_system(
+    mut commands: Commands,
+    missile_query: Query<&Missile>,
+    mut markers: ResMut<TrajectoryTrailMarkers>,
+    mut transforms: Query<&mut Transform, With<TrailMarker>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    const N: usize = 50;
+    let missile = match missile_query.iter().next() {
+        Some(m) => m,
+        None => {
+            if let Some(entities) = markers.0.take() {
+                for e in entities {
+                    commands.entity(e).despawn();
+                }
+            }
+            return;
+        }
+    };
+    if missile.path.len() < 2 {
+        if let Some(entities) = markers.0.take() {
+            for e in entities {
+                commands.entity(e).despawn();
+            }
+        }
+        return;
+    }
+
+    let path = &missile.path;
+    let len = path.len();
+    let positions: Vec<Vec3> = (0..N)
+        .map(|i| {
+            let idx = (i as f64 * (len - 1) as f64 / (N - 1).max(1) as f64) as usize;
+            path[idx.min(len - 1)].0
+        })
+        .collect();
+
+    let entities = if let Some(ent) = &mut markers.0 {
+        if ent.len() != N {
+            for e in ent.drain(..) {
+                commands.entity(e).despawn();
+            }
+            let sphere = meshes.add(Sphere::new(25000.0).mesh().uv(8, 6));
+            let mat = materials.add(StandardMaterial {
+                base_color: bevy::color::Color::srgb(0.2, 0.7, 1.0),
+                unlit: true,
+                ..default()
+            });
+            let new_entities: Vec<Entity> = (0..N)
+                .map(|_| {
+                    commands
+                        .spawn((
+                            Mesh3d(sphere.clone()),
+                            MeshMaterial3d(mat.clone()),
+                            Transform::default(),
+                            TrailMarker,
+                        ))
+                        .id()
+                })
+                .collect();
+            *ent = new_entities;
+        }
+        ent.clone()
+    } else {
+        let sphere = meshes.add(Sphere::new(25000.0).mesh().uv(8, 6));
+        let mat = materials.add(StandardMaterial {
+            base_color: bevy::color::Color::srgb(0.2, 0.7, 1.0),
+            unlit: true,
+            ..default()
+        });
+        let new_entities: Vec<Entity> = (0..N)
+            .map(|_| {
+                commands
+                    .spawn((
+                        Mesh3d(sphere.clone()),
+                        MeshMaterial3d(mat.clone()),
+                        Transform::default(),
+                        TrailMarker,
+                    ))
+                    .id()
+            })
+            .collect();
+        markers.0 = Some(new_entities.clone());
+        new_entities
+    };
+
+    for (i, &pos) in positions.iter().enumerate() {
+        if let Ok(mut transform) = transforms.get_mut(entities[i]) {
+            transform.translation = pos;
         }
     }
 }
