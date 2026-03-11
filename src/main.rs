@@ -167,7 +167,11 @@ fn main() {
         return;
     }
 
-    let mut selected_specs = registry.first().cloned().expect("Missile registry is empty!");
+    let mut selected_specs = registry.iter()
+        .find(|s| s.name.contains("DF-41"))
+        .cloned()
+        .or_else(|| registry.first().cloned())
+        .expect("Missile registry is empty!");
     if let Some(pos) = args.iter().position(|arg| arg == "--missile" || arg == "-m") {
         if let Some(target_name) = args.get(pos + 1) {
             if let Some(specs) = registry.iter().find(|s| s.name.to_lowercase().contains(&target_name.to_lowercase())) {
@@ -1080,23 +1084,21 @@ fn trajectory_system(
         };
         // Bevy 0.17 gizmos.sphere(position, radius, color)
         gizmos.sphere(pos, 50000.0, head_color);
-        
-        // Draw full path with phase-based colors
+
+        // Draw track: always show at least launch-to-current so track is visible from startup
+        let start_pos = missile.start_position_ecef.as_vec3();
         if missile.path.len() > 1 {
-            for i in 0..missile.path.len()-1 {
+            for i in 0..missile.path.len() - 1 {
                 let (p1, phase1) = missile.path[i];
-                let (p2, _phase2) = missile.path[i+1];
-                
+                let (p2, _phase2) = missile.path[i + 1];
                 let color = match phase1 {
                     FlightPhase::Boost => bevy::color::palettes::css::YELLOW,
                     FlightPhase::Ballistic => bevy::color::palettes::css::AQUA,
                     FlightPhase::ReEntry => bevy::color::palettes::css::RED,
                     FlightPhase::Landed => bevy::color::palettes::css::GREEN,
                 };
-                
                 gizmos.line(p1, p2, color);
             }
-            // Line to current position
             if let Some((last_pos, last_phase)) = missile.path.last() {
                 let color = match last_phase {
                     FlightPhase::Boost => bevy::color::palettes::css::YELLOW,
@@ -1105,6 +1107,11 @@ fn trajectory_system(
                     FlightPhase::Landed => bevy::color::palettes::css::GREEN,
                 };
                 gizmos.line(*last_pos, pos, color);
+            }
+        } else {
+            // Before we have 2 path points, draw launch-to-current so track is visible immediately
+            if start_pos.distance(pos) > 1000.0 {
+                gizmos.line(start_pos, pos, head_color);
             }
         }
     }
