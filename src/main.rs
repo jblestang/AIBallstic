@@ -125,13 +125,15 @@ struct WasmAbmEntities(pub Vec<Entity>);
 #[derive(Resource, Default)]
 struct WasmReentryEntities(pub Vec<Entity>);
 
-/// Map physics ECEF (same frame as `geodetic_to_ecef`) to world space so it matches the textured `Earth` entity (basis + texture longitude).
+/// WASM-only: physics vectors are in the same frame as the sim, but the textured `Earth` mesh uses a basis `Transform`;
+/// mesh markers must use `earth.transform_point(...)` to sit on the globe. Native Gizmos already matched raw ECEF — do not use this there.
+#[cfg(target_arch = "wasm32")]
 #[inline]
 fn ecef_to_globe_world(earth: &Transform, ecef_like: Vec3) -> Vec3 {
     earth.transform_point(ecef_like)
 }
 
-/// WASM mesh markers: same frame as globe, then nudged outward in world space to clear the sphere (WebGL depth).
+/// WASM mesh markers: globe frame, then nudged outward in world space to clear the sphere (WebGL depth).
 #[cfg(target_arch = "wasm32")]
 fn wasm_overlay_world(earth: &Transform, ecef_like: Vec3) -> Vec3 {
     const LIFT: f32 = 75_000.0;
@@ -288,8 +290,8 @@ fn main() {
         .add_systems(Startup, setup)
         .add_systems(EguiPrimaryContextPass, egui_stats_system)
         .add_systems(Update, (
-            physics_system, earth_alignment_system, trajectory_system, camera_system, input_system, 
-            solar_lighting_system, radar_scan_system, impact_prediction_system,
+            physics_system, trajectory_system, camera_system, input_system, 
+            solar_lighting_system, radar_scan_system, impact_prediction_system, earth_alignment_system,
             abm_c2_system, spawn_abm_system, abm_guidance_system, abm_kill_system, explosion_system,
             mirv_deployment_system, reentry_body_physics_system,
         ))
@@ -1046,7 +1048,6 @@ fn explosion_system(
 
 fn trajectory_system(
     mut gizmos: Gizmos,
-    earth_q: Query<&Transform, With<Earth>>,
     query: Query<&Missile>,
     reentry_query: Query<&ReentryBody>,
     radar_query: Query<&RadarStation>,
@@ -1056,14 +1057,12 @@ fn trajectory_system(
     settings: Res<SimulationSettings>,
     scenario: Res<ScenarioSelection>,
 ) {
-    let Ok(earth) = earth_q.single() else {
-        return;
-    };
-    let w = |v: Vec3| ecef_to_globe_world(&earth, v);
+    // Native: draw in raw physics ECEF (matches Gizmo / camera convention that was already correct).
+    // WASM: use `wasm_visual_overlay_system` for meshes; Gizmos here are usually invisible on Web.
 
     // Scenario sites (larger markers for selected launch / aim point)
     for site in GeoSiteId::ALL {
-        let p = w(site.aim_ecef().as_vec3());
+        let p = site.aim_ecef().as_vec3();
         let (radius, color) = if site == scenario.launch_site {
             (55_000.0f32, bevy::color::palettes::css::RED)
         } else if site == scenario.target_site {
@@ -1077,13 +1076,13 @@ fn trajectory_system(
     // Radar Stations
     if settings.show_radar_coverage {
         for radar in radar_query.iter() {
-            gizmos.sphere(w(radar.position_ecef.as_vec3()), 75000.0, bevy::color::palettes::css::BLUE);
+            gizmos.sphere(radar.position_ecef.as_vec3(), 75000.0, bevy::color::palettes::css::BLUE);
         }
     }
 
     // Defended Zones
     for zone in defended_zones.iter() {
-        let p_vec = w(zone.position_ecef.as_vec3());
+        let p_vec = zone.position_ecef.as_vec3();
         let up = p_vec.normalize();
 
         gizmos.sphere(p_vec, 30_000.0, bevy::color::palettes::css::GREEN);
@@ -1097,7 +1096,7 @@ fn trajectory_system(
 
     // Active Interceptors
     for abm in interceptor_query.iter() {
-        gizmos.sphere(w(abm.position_ecef.as_vec3()), 40_000.0, bevy::color::palettes::css::LIME);
+        gizmos.sphere(abm.position_ecef.as_vec3(), 40_000.0, bevy::color::palettes::css::LIME);
     }
 
     // Impact Prediction (CEP Scatter Visualization)
@@ -1106,7 +1105,7 @@ fn trajectory_system(
 
         for p in &prediction.coordinates_ecef {
             centroid += *p;
-            gizmos.sphere(w(p.as_vec3()), 15000.0, bevy::color::palettes::css::ORANGE);
+            gizmos.sphere(p.as_vec3(), 15000.0, bevy::color::palettes::css::ORANGE);
         }
 
         centroid /= prediction.coordinates_ecef.len() as f64;
@@ -1120,21 +1119,21 @@ fn trajectory_system(
 
         let cep_radius = distances[distances.len() / 2];
 
-        let c_w = w(centroid.as_vec3());
-        let up = c_w.normalize();
+        let p_vec = centroid.as_vec3();
+        let up = p_vec.normalize();
         let right = up.cross(Vec3::Y).normalize_or_zero();
         let fwd = up.cross(right).normalize_or_zero();
 
         let segments = 32;
         let first_point = {
             let angle: f32 = 0.0;
-            c_w + (right * angle.cos() + fwd * angle.sin()) * cep_radius as f32
+            p_vec + (right * angle.cos() + fwd * angle.sin()) * cep_radius as f32
         };
         let mut prev_point: Option<Vec3> = Some(first_point);
 
         for i in 0..=segments {
             let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
-            let cur_point = c_w + (right * angle.cos() + fwd * angle.sin()) * cep_radius as f32;
+            let cur_point = p_vec + (right * angle.cos() + fwd * angle.sin()) * cep_radius as f32;
 
             if let Some(prev) = prev_point {
                 gizmos.line(prev, cur_point, bevy::color::palettes::css::RED);
@@ -1153,23 +1152,23 @@ fn trajectory_system(
         let pulse = (time_sec * 5.0).sin() as f32;
         let center_radius = 40000.0 + (pulse * 15000.0);
 
-        gizmos.sphere(c_w, center_radius, bevy::color::palettes::css::RED);
+        gizmos.sphere(p_vec, center_radius, bevy::color::palettes::css::RED);
 
         let cross_size = 150000.0;
         gizmos.line(
-            c_w - right * cross_size,
-            c_w + right * cross_size,
+            p_vec - right * cross_size,
+            p_vec + right * cross_size,
             bevy::color::palettes::css::RED,
         );
         gizmos.line(
-            c_w - fwd * cross_size,
-            c_w + fwd * cross_size,
+            p_vec - fwd * cross_size,
+            p_vec + fwd * cross_size,
             bevy::color::palettes::css::RED,
         );
     }
 
     for missile in query.iter() {
-        let pos = w(missile.position_ecef.as_vec3());
+        let pos = missile.position_ecef.as_vec3();
         let head_color = match missile.phase {
             FlightPhase::Boost => bevy::color::palettes::css::YELLOW,
             FlightPhase::Ballistic => bevy::color::palettes::css::AQUA,
@@ -1190,7 +1189,7 @@ fn trajectory_system(
                     FlightPhase::ReEntry => bevy::color::palettes::css::RED,
                     FlightPhase::Landed => bevy::color::palettes::css::GREEN,
                 };
-                gizmos.line(w(p1), w(p2), color);
+                gizmos.line(p1, p2, color);
             }
             if let Some((last_pos, last_phase)) = missile.path.last() {
                 let color = match last_phase {
@@ -1199,16 +1198,16 @@ fn trajectory_system(
                     FlightPhase::ReEntry => bevy::color::palettes::css::RED,
                     FlightPhase::Landed => bevy::color::palettes::css::GREEN,
                 };
-                gizmos.line(w(*last_pos), pos, color);
+                gizmos.line(*last_pos, pos, color);
             }
         } else if start_pos.distance(pos_raw) > 1000.0 {
-            gizmos.line(w(start_pos), pos, head_color);
+            gizmos.line(start_pos, pos, head_color);
         }
     }
 
     // Reentry bodies (MIRV warheads & decoys)
     for body in reentry_query.iter() {
-        let pos = w(body.position_ecef.as_vec3());
+        let pos = body.position_ecef.as_vec3();
         if body.phase == FlightPhase::Landed {
             continue;
         }
@@ -1230,14 +1229,10 @@ fn trajectory_system(
 
         if body.path.len() > 1 {
             for i in 0..body.path.len() - 1 {
-                gizmos.line(
-                    w(body.path[i].0),
-                    w(body.path[i + 1].0),
-                    trail_color,
-                );
+                gizmos.line(body.path[i].0, body.path[i + 1].0, trail_color);
             }
             if let Some((last_pos, _)) = body.path.last() {
-                gizmos.line(w(*last_pos), pos, trail_color);
+                gizmos.line(*last_pos, pos, trail_color);
             }
         }
     }
