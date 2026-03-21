@@ -44,6 +44,16 @@ Simply running without arguments launches the default **Khorramshahr-4**:
 cargo run --release
 ```
 
+### Scenario (UI)
+
+In the **AIBallistic Command Center** panel you can pick:
+
+- **Launch site** — Tehran, Paris, Moscow, or Diego Garcia (spawn at 10 m altitude).
+- **Aim point** — same four cities (surface point at 0 m; guidance uses this as the target).
+- **Missile profile** — any entry from `assets/missiles.json`.
+
+Use **Respawn with selected scenario** to apply (despawns the current missile/MIRV debris and starts fresh). CLI `--missile "…"` still sets the initial profile on startup.
+
 ### In-sim fuel sweep (balancing / what-if)
 
 Native-only helper: search `fuel_mass` (fixed `burn_time`, so thrust ∝ fuel) for a trajectory that lands within a great-circle radius of the **default in-game target** (Diego Garcia), using the same integrator as the main app (fixed `dt`). This is for **game tuning only**, not a real-world range claim.
@@ -86,7 +96,7 @@ You can also build and run locally:
 
 ## 🌍 Simulation Domain
 
-The simulation tracks trajectories from launch sites (defaulting to Tehran) to global targets (defaulting to Diego Garcia), accounting for Earth's rotation and varying atmospheric density.
+The simulation tracks trajectories between configurable preset sites (Tehran, Paris, Moscow, Diego Garcia), accounting for Earth's rotation and varying atmospheric density.
 
 ---
 *Built with ❤️ by the AIBallistic Team*

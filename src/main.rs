@@ -62,6 +62,14 @@ pub struct ActiveMissileSpecs(pub MissileSpecs);
 #[derive(Resource)]
 pub struct MissileRegistry(pub Vec<MissileSpecs>);
 
+/// Launch site, aim point, and missile row from `assets/missiles.json` (UI + respawn).
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug)]
+struct ScenarioSelection {
+    launch_site: GeoSiteId,
+    target_site: GeoSiteId,
+    missile_index: usize,
+}
+
 // Radar Tracking Resources
 #[derive(Resource, Default)]
 struct TrackedMissileState {
@@ -75,9 +83,12 @@ struct TrackedMissileState {
 #[derive(Resource, Default)]
 struct ImpactPrediction {
     pub coordinates_ecef: Vec<DVec3>,
+    /// Filled by `impact_prediction_system` (native only); reserved for future UI / C2 use.
+    #[allow(dead_code)]
     pub centroid_ecef: Option<DVec3>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Resource, Default)]
 struct ImpactErrorHistory {
     pub data: Vec<[f64; 2]>,
@@ -89,13 +100,6 @@ struct MissileFlightHistory {
     pub mach: Vec<[f64; 2]>,
     pub altitude: Vec<[f64; 2]>,
 }
-
-/// On WASM, impact prediction runs only every this many sim seconds to avoid blocking.
-#[cfg(target_arch = "wasm32")]
-const IMPACT_PREDICTION_INTERVAL: f64 = 3.0;
-#[cfg(target_arch = "wasm32")]
-#[derive(Resource, Default)]
-struct LastImpactPredictionTime(pub f64);
 
 /// WASM-only: trail markers (small spheres) for trajectory when Gizmos don't render on web.
 #[cfg(target_arch = "wasm32")]
@@ -201,6 +205,16 @@ fn main() {
         }
     }
 
+    let missile_index = registry
+        .iter()
+        .position(|s| s.name == selected_specs.name)
+        .unwrap_or(0);
+    let scenario = ScenarioSelection {
+        launch_site: GeoSiteId::Tehran,
+        target_site: GeoSiteId::DiegoGarcia,
+        missile_index,
+    };
+
     #[cfg(target_arch = "wasm32")]
     let window_plugin = WindowPlugin {
         primary_window: Some(Window {
@@ -219,6 +233,7 @@ fn main() {
         .add_plugins(EguiPlugin::default())
         .insert_resource(MissileRegistry(registry))
         .insert_resource(ActiveMissileSpecs(selected_specs))
+        .insert_resource(scenario)
         .insert_resource(SimulationSettings { 
             time_scale: 10.0, 
             rotation_paused: false,
@@ -251,6 +266,7 @@ fn main() {
         .add_plugins(EguiPlugin::default())
         .insert_resource(MissileRegistry(registry))
         .insert_resource(ActiveMissileSpecs(selected_specs))
+        .insert_resource(scenario)
         .insert_resource(SimulationSettings { 
             time_scale: 10.0, 
             rotation_paused: false,
@@ -264,17 +280,15 @@ fn main() {
         })
         .init_resource::<TrackedMissileState>()
         .init_resource::<ImpactPrediction>()
-        .init_resource::<ImpactErrorHistory>()
         .init_resource::<MissileFlightHistory>()
         .init_resource::<ABMLaunchQueue>()
         .init_resource::<MirvDeploymentTracker>()
-        .init_resource::<LastImpactPredictionTime>()
         .init_resource::<TrajectoryTrailMarkers>()
         .add_systems(Startup, setup)
         .add_systems(EguiPrimaryContextPass, egui_stats_system)
         .add_systems(Update, (
             physics_system, trajectory_system, camera_system, input_system, 
-            solar_lighting_system, radar_scan_system, impact_prediction_system, earth_alignment_system,
+            solar_lighting_system, radar_scan_system, earth_alignment_system,
             abm_c2_system, spawn_abm_system, abm_guidance_system, abm_kill_system, explosion_system,
             mirv_deployment_system, reentry_body_physics_system,
             wasm_trajectory_trail_system,
@@ -288,6 +302,7 @@ fn setup(
     mut materials: ResMut<Assets<StandardMaterial>>,
     asset_server: Res<AssetServer>,
     active_specs: Res<ActiveMissileSpecs>,
+    scenario: Res<ScenarioSelection>,
 ) {
     // Earth (North Pole at +Y, Prime Meridian at +X)
     commands.spawn((
@@ -347,22 +362,7 @@ fn setup(
         radius: 300_000.0, // 300 km point-defense radius
     });
 
-    // Launch from TEHRAN, IR
-    // Geodetic: 35.6892° N, 51.3890° E
-    let tehran_ecef = geodetic_to_ecef(35.6892, 51.3890, 10.0);
-    let specs = active_specs.0.clone();
-    let initial_mass = specs.total_mass();
-    
-    commands.spawn(Missile {
-        position_ecef: tehran_ecef,
-        start_position_ecef: tehran_ecef,
-        velocity_ecef: DVec3::ZERO,
-        mass: initial_mass,
-        timer: 0.0,
-        phase: FlightPhase::Boost,
-        path: Vec::new(),
-        model: Box::new(BallisticMissilePhysics::new(specs)),
-    });
+    spawn_missile_with_scenario(&mut commands, &active_specs, &scenario);
 
     // Camera
     commands.spawn((
@@ -641,6 +641,7 @@ fn compute_ideal_delta_v(specs: &MissileSpecs) -> f64 {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn compute_ballistic_impact(
     start_pos: DVec3,
     start_vel: DVec3,
@@ -653,9 +654,6 @@ fn compute_ballistic_impact(
     let mut vel = start_vel;
     let mut predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
     let mut iterations = 0;
-    #[cfg(target_arch = "wasm32")]
-    const MAX_ITER: usize = 1500;
-    #[cfg(not(target_arch = "wasm32"))]
     const MAX_ITER: usize = 5000;
 
     while predicted_alt > 0.0 && iterations < MAX_ITER {
@@ -701,28 +699,16 @@ fn compute_ballistic_impact(
     pos
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn impact_prediction_system(
     tracked_state: Res<TrackedMissileState>,
     mut prediction: ResMut<ImpactPrediction>,
     settings: Res<SimulationSettings>,
     missile_query: Query<&Missile>,
     mut error_history: ResMut<ImpactErrorHistory>,
-    #[cfg(target_arch = "wasm32")] mut last_time: ResMut<LastImpactPredictionTime>,
 ) {
     if !tracked_state.is_changed() || tracked_state.ekf_state.is_none() {
         return;
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let t = missile_query.iter().next().map(|m| m.timer as f64).unwrap_or(0.0);
-        // Defer first run to avoid freeze on first radar update; then run every INTERVAL
-        if t < 20.0 {
-            return;
-        }
-        if t - last_time.0 < IMPACT_PREDICTION_INTERVAL {
-            return;
-        }
-        last_time.0 = t;
     }
 
     let ekf = tracked_state.ekf_state.unwrap();
@@ -731,11 +717,7 @@ fn impact_prediction_system(
     
     prediction.coordinates_ecef.clear();
 
-    // Fewer Monte Carlo runs on WASM to avoid blocking the main thread
-    #[cfg(target_arch = "wasm32")]
-    let n_simulations = 8usize;
-    #[cfg(not(target_arch = "wasm32"))]
-    let n_simulations = 100;
+    let n_simulations = 100usize;
     use rand::Rng;
     use rand_distr::{Distribution, StandardNormal};
     let mut rng = rand::thread_rng();
@@ -1033,15 +1015,20 @@ fn trajectory_system(
     interceptor_query: Query<&ABMInterceptor>,
     prediction: Res<ImpactPrediction>,
     settings: Res<SimulationSettings>,
+    scenario: Res<ScenarioSelection>,
 ) {
-    // Target Markers
-    // Tehran - RED
-    let tehran = geodetic_to_ecef(35.6892, 51.3890, 0.0);
-    gizmos.sphere(tehran.as_vec3(), 50000.0, bevy::color::palettes::css::RED);
-
-    // Diego Garcia (target) - PURPLE
-    let diego = geodetic_to_ecef(DIEGO_GARCIA_LAT, DIEGO_GARCIA_LON, 0.0);
-    gizmos.sphere(diego.as_vec3(), 65000.0, bevy::color::palettes::css::PURPLE);
+    // Scenario sites (larger markers for selected launch / aim point)
+    for site in GeoSiteId::ALL {
+        let p = site.aim_ecef().as_vec3();
+        let (radius, color) = if site == scenario.launch_site {
+            (55_000.0f32, bevy::color::palettes::css::RED)
+        } else if site == scenario.target_site {
+            (65_000.0f32, bevy::color::palettes::css::PURPLE)
+        } else {
+            (32_000.0f32, bevy::color::palettes::css::DIM_GRAY)
+        };
+        gizmos.sphere(p, radius, color);
+    }
 
     // Radar Stations
     if settings.show_radar_coverage {
@@ -1470,12 +1457,14 @@ fn egui_stats_system(
     window_query: Query<&Window, With<bevy::window::PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
     _settings: Res<SimulationSettings>,
-    active_specs: Res<ActiveMissileSpecs>,
-    error_history: Res<ImpactErrorHistory>,
-    flight_history: Res<MissileFlightHistory>,
+    mut active_specs: ResMut<ActiveMissileSpecs>,
+    mut scenario: ResMut<ScenarioSelection>,
+    #[cfg(not(target_arch = "wasm32"))] error_history: Res<ImpactErrorHistory>,
+    mut flight_history: ResMut<MissileFlightHistory>,
     registry: Res<MissileRegistry>,
     mut db_initialized: Local<bool>,
     mut mirv_tracker: ResMut<MirvDeploymentTracker>,
+    mut tracked_state: ResMut<TrackedMissileState>,
 ) -> Result {
     if time.elapsed_secs() < 0.2 {
         return Ok(());
@@ -1494,7 +1483,7 @@ fn egui_stats_system(
                 ui.style_mut().spacing.button_padding = egui::vec2(10.0, 5.0);
 
                 if let Some((_entity, missile)) = missile_query.iter().next() {
-                    let target_ecef = geodetic_to_ecef(DIEGO_GARCIA_LAT, DIEGO_GARCIA_LON, 0.0);
+                    let target_ecef = scenario.target_site.aim_ecef();
                     let dist_to_target = missile.position_ecef.distance(target_ecef) / 1000.0;
                     let dist_from_start = missile.position_ecef.distance(missile.start_position_ecef) / 1000.0;
 
@@ -1517,63 +1506,128 @@ fn egui_stats_system(
                             safe_despawn(&mut commands, ent);
                         }
                         mirv_tracker.deployed_missiles.clear();
-                        spawn_default_missile(&mut commands, &active_specs);
+                        flight_history.velocity.clear();
+                        flight_history.mach.clear();
+                        flight_history.altitude.clear();
+                        *tracked_state = TrackedMissileState::default();
+                        let n = registry.0.len();
+                        if n > 0 {
+                            scenario.missile_index = scenario.missile_index.min(n - 1);
+                            active_specs.0 = registry.0[scenario.missile_index].clone();
+                        }
+                        spawn_missile_with_scenario(&mut commands, &active_specs, &scenario);
                     }
                 }
 
                 ui.separator();
-
-                // --- Impact Prediction Error ---
-                ui.strong("Impact Prediction Error");
-                if error_history.data.is_empty() {
-                    ui.label("Waiting for radar tracking data...");
+                ui.strong("Scenario");
+                ui.label("Launch → aim (guidance uses aim point at 0 m altitude).");
+                egui::ComboBox::from_id_salt("scenario_launch")
+                    .selected_text(scenario.launch_site.label())
+                    .show_ui(ui, |ui| {
+                        for site in GeoSiteId::ALL {
+                            ui.selectable_value(&mut scenario.launch_site, site, site.label());
+                        }
+                    });
+                egui::ComboBox::from_id_salt("scenario_target")
+                    .selected_text(scenario.target_site.label())
+                    .show_ui(ui, |ui| {
+                        for site in GeoSiteId::ALL {
+                            ui.selectable_value(&mut scenario.target_site, site, site.label());
+                        }
+                    });
+                let n_missiles = registry.0.len();
+                let idx = if n_missiles == 0 {
+                    0
                 } else {
-                    let last = error_history.data.last().unwrap();
-                    ui.label(format!("Error: {:.1} km  (t = {:.0} s)", last[1], last[0]));
-
-                    let points: PlotPoints = error_history.data.iter().copied().collect();
-                    let line = Line::new("Prediction Error", points)
-                        .color(egui::Color32::from_rgb(255, 100, 50));
-
-                    // Least-squares linear regression: y = a + b*x
-                    let n = error_history.data.len() as f64;
-                    let (sum_x, sum_y, sum_xx, sum_xy) = error_history.data.iter()
-                        .fold((0.0, 0.0, 0.0, 0.0), |(sx, sy, sxx, sxy), p| {
-                            (sx + p[0], sy + p[1], sxx + p[0] * p[0], sxy + p[0] * p[1])
-                        });
-                    let denom = n * sum_xx - sum_x * sum_x;
-                    let (reg_line, reg_label) = if denom.abs() > 1e-12 && n >= 2.0 {
-                        let b = (n * sum_xy - sum_x * sum_y) / denom;
-                        let a = (sum_y - b * sum_x) / n;
-                        let x0 = error_history.data.first().unwrap()[0];
-                        let x1 = error_history.data.last().unwrap()[0];
-                        let reg_pts: PlotPoints = vec![[x0, a + b * x0], [x1, a + b * x1]].into_iter().collect();
-                        let label = format!("Trend: {:.2} km/s", b);
-                        (Some(Line::new("Linear Regression", reg_pts)
-                            .color(egui::Color32::from_rgb(150, 200, 255))
-                            .style(egui_plot::LineStyle::dashed_dense())), label)
-                    } else {
-                        (None, String::new())
-                    };
-
-                    if !reg_label.is_empty() {
-                        ui.label(reg_label);
+                    scenario.missile_index.min(n_missiles - 1)
+                };
+                let missile_label = registry
+                    .0
+                    .get(idx)
+                    .map(|s| s.name)
+                    .unwrap_or("(no missiles)");
+                egui::ComboBox::from_id_salt("scenario_missile")
+                    .selected_text(missile_label)
+                    .show_ui(ui, |ui| {
+                        for (i, specs) in registry.0.iter().enumerate() {
+                            ui.selectable_value(&mut scenario.missile_index, i, specs.name);
+                        }
+                    });
+                if ui.button("Respawn with selected scenario").clicked() && n_missiles > 0 {
+                    scenario.missile_index = scenario.missile_index.min(n_missiles - 1);
+                    active_specs.0 = registry.0[scenario.missile_index].clone();
+                    for (ent, _) in missile_query.iter() {
+                        safe_despawn(&mut commands, ent);
                     }
+                    for (ent, _) in reentry_query.iter() {
+                        safe_despawn(&mut commands, ent);
+                    }
+                    mirv_tracker.deployed_missiles.clear();
+                    flight_history.velocity.clear();
+                    flight_history.mach.clear();
+                    flight_history.altitude.clear();
+                    *tracked_state = TrackedMissileState::default();
+                    spawn_missile_with_scenario(&mut commands, &active_specs, &scenario);
+                }
 
-                    Plot::new("impact_error_plot")
-                        .height(200.0)
-                        .x_axis_label("t (s)")
-                        .y_axis_label("km")
-                        .allow_drag(false)
-                        .allow_zoom(false)
-                        .allow_scroll(false)
-                        .allow_boxed_zoom(false)
-                        .show(ui, |plot_ui| {
-                            plot_ui.line(line);
-                            if let Some(rl) = reg_line {
-                                plot_ui.line(rl);
-                            }
-                        });
+                ui.separator();
+
+                // Impact prediction (MC + CEP) is disabled on WASM — see Update schedule.
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    // --- Impact Prediction Error ---
+                    ui.strong("Impact Prediction Error");
+                    if error_history.data.is_empty() {
+                        ui.label("Waiting for radar tracking data...");
+                    } else {
+                        let last = error_history.data.last().unwrap();
+                        ui.label(format!("Error: {:.1} km  (t = {:.0} s)", last[1], last[0]));
+
+                        let points: PlotPoints = error_history.data.iter().copied().collect();
+                        let line = Line::new("Prediction Error", points)
+                            .color(egui::Color32::from_rgb(255, 100, 50));
+
+                        // Least-squares linear regression: y = a + b*x
+                        let n = error_history.data.len() as f64;
+                        let (sum_x, sum_y, sum_xx, sum_xy) = error_history.data.iter()
+                            .fold((0.0, 0.0, 0.0, 0.0), |(sx, sy, sxx, sxy), p| {
+                                (sx + p[0], sy + p[1], sxx + p[0] * p[0], sxy + p[0] * p[1])
+                            });
+                        let denom = n * sum_xx - sum_x * sum_x;
+                        let (reg_line, reg_label) = if denom.abs() > 1e-12 && n >= 2.0 {
+                            let b = (n * sum_xy - sum_x * sum_y) / denom;
+                            let a = (sum_y - b * sum_x) / n;
+                            let x0 = error_history.data.first().unwrap()[0];
+                            let x1 = error_history.data.last().unwrap()[0];
+                            let reg_pts: PlotPoints = vec![[x0, a + b * x0], [x1, a + b * x1]].into_iter().collect();
+                            let label = format!("Trend: {:.2} km/s", b);
+                            (Some(Line::new("Linear Regression", reg_pts)
+                                .color(egui::Color32::from_rgb(150, 200, 255))
+                                .style(egui_plot::LineStyle::dashed_dense())), label)
+                        } else {
+                            (None, String::new())
+                        };
+
+                        if !reg_label.is_empty() {
+                            ui.label(reg_label);
+                        }
+
+                        Plot::new("impact_error_plot")
+                            .height(200.0)
+                            .x_axis_label("t (s)")
+                            .y_axis_label("km")
+                            .allow_drag(false)
+                            .allow_zoom(false)
+                            .allow_scroll(false)
+                            .allow_boxed_zoom(false)
+                            .show(ui, |plot_ui| {
+                                plot_ui.line(line);
+                                if let Some(rl) = reg_line {
+                                    plot_ui.line(rl);
+                                }
+                            });
+                    }
                 }
 
                 ui.separator();
@@ -1965,19 +2019,24 @@ fn reentry_body_physics_system(
     }
 }
 
-fn spawn_default_missile(commands: &mut Commands, active_specs: &ActiveMissileSpecs) {
-    let tehran_ecef = geodetic_to_ecef(35.6892, 51.3890, 10.0);
+fn spawn_missile_with_scenario(
+    commands: &mut Commands,
+    active_specs: &ActiveMissileSpecs,
+    scenario: &ScenarioSelection,
+) {
+    let launch = scenario.launch_site.launch_ecef();
+    let aim = scenario.target_site.aim_ecef();
     let specs = active_specs.0.clone();
     let initial_mass = specs.total_mass();
     commands.spawn(Missile {
-        position_ecef: tehran_ecef,
-        start_position_ecef: tehran_ecef,
+        position_ecef: launch,
+        start_position_ecef: launch,
         velocity_ecef: DVec3::ZERO,
         mass: initial_mass,
         timer: 0.0,
         phase: FlightPhase::Boost,
         path: Vec::new(),
-        model: Box::new(BallisticMissilePhysics::new(specs)),
+        model: Box::new(BallisticMissilePhysics::new(specs, aim)),
     });
 }
 

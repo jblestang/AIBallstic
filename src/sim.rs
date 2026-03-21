@@ -3,8 +3,8 @@
 use glam::DVec3;
 
 use crate::missiles::{
-    BallisticMissilePhysics, DIEGO_GARCIA_LAT, DIEGO_GARCIA_LON, EARTH_OMEGA, EARTH_RADIUS,
-    FlightPhase, GRAVITY_CONSTANT, MissileSpecs, PhysicsModel,
+    BallisticMissilePhysics, EARTH_OMEGA, EARTH_RADIUS, FlightPhase, GRAVITY_CONSTANT, MissileSpecs,
+    PhysicsModel,
 };
 
 /// Settings for offline runs (game UI uses variable frame `dt` × `time_scale`; this is fixed-`dt`).
@@ -36,7 +36,7 @@ pub struct GroundImpactResult {
     pub position_ecef: DVec3,
     pub impact_lat_deg: f64,
     pub impact_lon_deg: f64,
-    /// Great-circle miss distance to the configured target (Diego Garcia for `BallisticMissilePhysics`).
+    /// Great-circle miss distance to the aim point used in `BallisticMissilePhysics`.
     pub miss_distance_m: f64,
 }
 
@@ -63,8 +63,14 @@ fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 }
 
 /// Integrate until the missile intersects the spherical Earth (`r < EARTH_RADIUS` after 1 s), or `max_time_s`.
-pub fn simulate_until_ground_impact(specs: MissileSpecs, launch_ecef: DVec3, params: &SimParams) -> GroundImpactResult {
-    let model = BallisticMissilePhysics::new(specs);
+pub fn simulate_until_ground_impact(
+    specs: MissileSpecs,
+    launch_ecef: DVec3,
+    target_ecef: DVec3,
+    params: &SimParams,
+) -> GroundImpactResult {
+    let model = BallisticMissilePhysics::new(specs, target_ecef);
+    let (tgt_lat, tgt_lon) = ecef_to_geodetic_deg(target_ecef);
     let dt = params.dt as f32;
 
     let mut pos = launch_ecef;
@@ -77,7 +83,7 @@ pub fn simulate_until_ground_impact(specs: MissileSpecs, launch_ecef: DVec3, par
         let r = pos.length();
         if r < EARTH_RADIUS && timer > 1.0 {
             let (lat, lon) = ecef_to_geodetic_deg(pos);
-            let miss = haversine_m(lat, lon, DIEGO_GARCIA_LAT, DIEGO_GARCIA_LON);
+            let miss = haversine_m(lat, lon, tgt_lat, tgt_lon);
             return GroundImpactResult {
                 landed: true,
                 flight_time_s: timer,
@@ -115,7 +121,7 @@ pub fn simulate_until_ground_impact(specs: MissileSpecs, launch_ecef: DVec3, par
     }
 
     let (lat, lon) = ecef_to_geodetic_deg(pos);
-    let miss = haversine_m(lat, lon, DIEGO_GARCIA_LAT, DIEGO_GARCIA_LON);
+    let miss = haversine_m(lat, lon, tgt_lat, tgt_lon);
     GroundImpactResult {
         landed: false,
         flight_time_s: timer,

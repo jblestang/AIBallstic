@@ -63,6 +63,65 @@ pub const MOSCOW_LON: f64 = 37.6173;
 pub const DIEGO_GARCIA_LAT: f64 = -7.31337;
 pub const DIEGO_GARCIA_LON: f64 = 72.41615;
 
+pub const TEHRAN_LAT: f64 = 35.6892;
+pub const TEHRAN_LON: f64 = 51.3890;
+
+pub const PARIS_LAT: f64 = 48.8566;
+pub const PARIS_LON: f64 = 2.3522;
+
+/// Launch altitude (m) for scenario presets (slightly above terrain).
+pub const SCENARIO_LAUNCH_ALT_M: f64 = 10.0;
+
+/// Named sites used for launch / aim point selection in the UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum GeoSiteId {
+    #[default]
+    Tehran,
+    Paris,
+    Moscow,
+    DiegoGarcia,
+}
+
+impl GeoSiteId {
+    pub const ALL: [GeoSiteId; 4] = [
+        GeoSiteId::Tehran,
+        GeoSiteId::Paris,
+        GeoSiteId::Moscow,
+        GeoSiteId::DiegoGarcia,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GeoSiteId::Tehran => "Tehran",
+            GeoSiteId::Paris => "Paris",
+            GeoSiteId::Moscow => "Moscow",
+            GeoSiteId::DiegoGarcia => "Diego Garcia",
+        }
+    }
+
+    /// Geodetic coordinates for the site (lat °, lon °).
+    pub fn lat_lon(self) -> (f64, f64) {
+        match self {
+            GeoSiteId::Tehran => (TEHRAN_LAT, TEHRAN_LON),
+            GeoSiteId::Paris => (PARIS_LAT, PARIS_LON),
+            GeoSiteId::Moscow => (MOSCOW_LAT, MOSCOW_LON),
+            GeoSiteId::DiegoGarcia => (DIEGO_GARCIA_LAT, DIEGO_GARCIA_LON),
+        }
+    }
+
+    /// ECEF at `SCENARIO_LAUNCH_ALT_M` (missile spawn).
+    pub fn launch_ecef(self) -> DVec3 {
+        let (lat, lon) = self.lat_lon();
+        geodetic_to_ecef(lat, lon, SCENARIO_LAUNCH_ALT_M)
+    }
+
+    /// ECEF on the reference sphere at 0 m altitude (map marker + guidance aim).
+    pub fn aim_ecef(self) -> DVec3 {
+        let (lat, lon) = self.lat_lon();
+        geodetic_to_ecef(lat, lon, 0.0)
+    }
+}
+
 // --- Core Structs ---
 // --- Missile Specification Structure ---
 
@@ -196,11 +255,8 @@ pub struct BallisticMissilePhysics {
 }
 
 impl BallisticMissilePhysics {
-    pub fn new(specs: MissileSpecs) -> Self {
-        Self {
-            specs,
-            target_ecef: geodetic_to_ecef(DIEGO_GARCIA_LAT, DIEGO_GARCIA_LON, 0.0),
-        }
+    pub fn new(specs: MissileSpecs, target_ecef: DVec3) -> Self {
+        Self { specs, target_ecef }
     }
 }
 

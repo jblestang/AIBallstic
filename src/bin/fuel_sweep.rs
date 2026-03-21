@@ -3,7 +3,9 @@
 //!
 //! Run from the repo root: `cargo run --release --bin fuel_sweep`
 
-use aiballistic::missiles::{geodetic_to_ecef, get_missile_registry, MissileSpecs};
+use aiballistic::missiles::{
+    geodetic_to_ecef, get_missile_registry, MissileSpecs, DIEGO_GARCIA_LAT, DIEGO_GARCIA_LON,
+};
 use aiballistic::sim::{simulate_until_ground_impact, SimParams};
 
 const DEFAULT_MISSILE: &str = "Khorramshahr-4 (Kheibar)";
@@ -112,6 +114,7 @@ fn main() {
     }
 
     let launch = geodetic_to_ecef(TEHRAN_LAT, TEHRAN_LON, TEHRAN_ALT_M);
+    let target_ecef = geodetic_to_ecef(DIEGO_GARCIA_LAT, DIEGO_GARCIA_LON, 0.0);
     let params = SimParams {
         dt,
         coriolis_enabled: coriolis,
@@ -125,7 +128,7 @@ fn main() {
     let run = |fuel: f64| {
         let mut s = base.clone();
         s.fuel_mass = fuel;
-        simulate_until_ground_impact(s, launch, &params)
+        simulate_until_ground_impact(s, launch, target_ecef, &params)
     };
 
     let baseline = run(base_fuel);
