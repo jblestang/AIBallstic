@@ -1,7 +1,6 @@
 use bevy::prelude::*;
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
-use crate::*;
 
 // ============================================================================
 // Core Physical Constants
@@ -43,9 +42,26 @@ pub const GRAVITY_CONSTANT: f64 = G * EARTH_MASS;
 /// [Reference: Earth's rotation period (Sidereal day)]
 pub const EARTH_OMEGA: DVec3 = DVec3::new(0.0, 7.2921159e-5, 0.0); // Rad/s around Y axis
 
-// Target Coordinates
+/// WGS-like spherical ECEF frame used by the game (North +Y, lon=0 at +X).
+#[inline]
+pub fn geodetic_to_ecef(lat: f64, lon: f64, alt: f64) -> DVec3 {
+    let lat_rad = lat.to_radians();
+    let lon_rad = lon.to_radians();
+    let r = EARTH_RADIUS + alt;
+    DVec3::new(
+        r * lat_rad.cos() * lon_rad.cos(),
+        r * lat_rad.sin(),
+        -r * lat_rad.cos() * lon_rad.sin(),
+    )
+}
+
+// Reference points (ABM scenario still anchored near Moscow)
 pub const MOSCOW_LAT: f64 = 55.7558;
 pub const MOSCOW_LON: f64 = 37.6173;
+
+// Default ballistic target (launch remains Tehran in main)
+pub const DIEGO_GARCIA_LAT: f64 = -7.31337;
+pub const DIEGO_GARCIA_LON: f64 = 72.41615;
 
 // --- Core Structs ---
 // --- Missile Specification Structure ---
@@ -183,7 +199,7 @@ impl BallisticMissilePhysics {
     pub fn new(specs: MissileSpecs) -> Self {
         Self {
             specs,
-            target_ecef: geodetic_to_ecef(MOSCOW_LAT, MOSCOW_LON, 0.0),
+            target_ecef: geodetic_to_ecef(DIEGO_GARCIA_LAT, DIEGO_GARCIA_LON, 0.0),
         }
     }
 }

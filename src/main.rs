@@ -1,4 +1,4 @@
-mod missiles;
+use aiballistic::missiles::*;
 
 use bevy::prelude::*;
 use bevy::window::{Window, WindowPlugin};
@@ -6,7 +6,6 @@ use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use glam::{DVec3, Vec3};
 use nalgebra::{SMatrix, SVector};
 use std::f32::consts::PI;
-use missiles::*;
 use chrono::{Datelike, Timelike, Utc};
 
 // Constants
@@ -183,7 +182,7 @@ fn main() {
     }
 
     let mut selected_specs = registry.iter()
-        .find(|s| s.name.contains("DF-41"))
+        .find(|s| s.name.contains("Khorramshahr-4"))
         .cloned()
         .or_else(|| registry.first().cloned())
         .expect("Missile registry is empty!");
@@ -322,7 +321,7 @@ fn setup(
 
 
     // Radar Station placed 1000 km south of Moscow (bearing south).
-    // (Used for tracking the Tehran->Moscow flight in this scenario.)
+    // (Legacy placement; default flight is Tehran → Diego Garcia.)
     let (radar_lat, radar_lon) = destination_point(55.7558, 37.6173, 180.0, 1_000_000.0);
     commands.spawn(RadarStation {
         position_ecef: geodetic_to_ecef(radar_lat, radar_lon, 100.0),
@@ -655,7 +654,7 @@ fn compute_ballistic_impact(
     let mut predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
     let mut iterations = 0;
     #[cfg(target_arch = "wasm32")]
-    const MAX_ITER: usize = 2000;
+    const MAX_ITER: usize = 1500;
     #[cfg(not(target_arch = "wasm32"))]
     const MAX_ITER: usize = 5000;
 
@@ -716,6 +715,10 @@ fn impact_prediction_system(
     #[cfg(target_arch = "wasm32")]
     {
         let t = missile_query.iter().next().map(|m| m.timer as f64).unwrap_or(0.0);
+        // Defer first run to avoid freeze on first radar update; then run every INTERVAL
+        if t < 20.0 {
+            return;
+        }
         if t - last_time.0 < IMPACT_PREDICTION_INTERVAL {
             return;
         }
@@ -730,7 +733,7 @@ fn impact_prediction_system(
 
     // Fewer Monte Carlo runs on WASM to avoid blocking the main thread
     #[cfg(target_arch = "wasm32")]
-    let n_simulations = 15usize;
+    let n_simulations = 8usize;
     #[cfg(not(target_arch = "wasm32"))]
     let n_simulations = 100;
     use rand::Rng;
@@ -1036,9 +1039,9 @@ fn trajectory_system(
     let tehran = geodetic_to_ecef(35.6892, 51.3890, 0.0);
     gizmos.sphere(tehran.as_vec3(), 50000.0, bevy::color::palettes::css::RED);
 
-    // Moscow - PURPLE
-    let moscow = geodetic_to_ecef(MOSCOW_LAT, MOSCOW_LON, 0.0);
-    gizmos.sphere(moscow.as_vec3(), 65000.0, bevy::color::palettes::css::PURPLE);
+    // Diego Garcia (target) - PURPLE
+    let diego = geodetic_to_ecef(DIEGO_GARCIA_LAT, DIEGO_GARCIA_LON, 0.0);
+    gizmos.sphere(diego.as_vec3(), 65000.0, bevy::color::palettes::css::PURPLE);
 
     // Radar Stations
     if settings.show_radar_coverage {
@@ -1229,7 +1232,29 @@ fn wasm_trajectory_trail_system(
             return;
         }
     };
-    if missile.path.len() < 2 {
+    let path = &missile.path;
+    let start = missile.start_position_ecef.as_vec3();
+    let current = missile.position_ecef.as_vec3();
+
+    let positions: Vec<Vec3> = if path.len() >= 2 {
+        let len = path.len();
+        (0..N)
+            .map(|i| {
+                let idx = (i as f64 * (len - 1) as f64 / (N - 1).max(1) as f64) as usize;
+                path[idx.min(len - 1)].0
+            })
+            .collect()
+    } else {
+        // From first frame: show launch-to-current segment so track is visible immediately
+        (0..N)
+            .map(|i| {
+                let t = i as f32 / (N - 1).max(1) as f32;
+                start.lerp(current, t)
+            })
+            .collect()
+    };
+
+    if path.len() < 2 && start.distance(current) < 1000.0 {
         if let Some(entities) = markers.0.take() {
             for e in entities {
                 commands.entity(e).despawn();
@@ -1238,33 +1263,25 @@ fn wasm_trajectory_trail_system(
         return;
     }
 
-    let path = &missile.path;
-    let len = path.len();
-    let positions: Vec<Vec3> = (0..N)
-        .map(|i| {
-            let idx = (i as f64 * (len - 1) as f64 / (N - 1).max(1) as f64) as usize;
-            path[idx.min(len - 1)].0
-        })
-        .collect();
-
+    const SPHERE_R: f32 = 45000.0;
     let entities = if let Some(ent) = &mut markers.0 {
         if ent.len() != N {
             for e in ent.drain(..) {
                 commands.entity(e).despawn();
             }
-            let sphere = meshes.add(Sphere::new(25000.0).mesh().uv(8, 6));
+            let sphere = meshes.add(Sphere::new(SPHERE_R).mesh().uv(8, 6));
             let mat = materials.add(StandardMaterial {
-                base_color: bevy::color::Color::srgb(0.2, 0.7, 1.0),
+                base_color: bevy::color::Color::srgb(0.2, 0.8, 1.0),
                 unlit: true,
                 ..default()
             });
             let new_entities: Vec<Entity> = (0..N)
-                .map(|_| {
+                .map(|i| {
                     commands
                         .spawn((
                             Mesh3d(sphere.clone()),
                             MeshMaterial3d(mat.clone()),
-                            Transform::default(),
+                            Transform::from_translation(positions[i]),
                             TrailMarker,
                         ))
                         .id()
@@ -1274,19 +1291,19 @@ fn wasm_trajectory_trail_system(
         }
         ent.clone()
     } else {
-        let sphere = meshes.add(Sphere::new(25000.0).mesh().uv(8, 6));
+        let sphere = meshes.add(Sphere::new(SPHERE_R).mesh().uv(8, 6));
         let mat = materials.add(StandardMaterial {
-            base_color: bevy::color::Color::srgb(0.2, 0.7, 1.0),
+            base_color: bevy::color::Color::srgb(0.2, 0.8, 1.0),
             unlit: true,
             ..default()
         });
         let new_entities: Vec<Entity> = (0..N)
-            .map(|_| {
+            .map(|i| {
                 commands
                     .spawn((
                         Mesh3d(sphere.clone()),
                         MeshMaterial3d(mat.clone()),
-                        Transform::default(),
+                        Transform::from_translation(positions[i]),
                         TrailMarker,
                     ))
                     .id()
@@ -1359,17 +1376,6 @@ fn solar_lighting_system(
 }
 
 // --- Utility Functions ---
-
-pub fn geodetic_to_ecef(lat: f64, lon: f64, alt: f64) -> DVec3 {
-    let lat_rad = lat.to_radians();
-    let lon_rad = lon.to_radians();
-    let r = EARTH_RADIUS + alt;
-    DVec3::new(
-        r * lat_rad.cos() * lon_rad.cos(),
-        r * lat_rad.sin(),
-        -r * lat_rad.cos() * lon_rad.sin(),
-    )
-}
 
 fn destination_point(lat_deg: f64, lon_deg: f64, bearing_deg: f64, distance_m: f64) -> (f64, f64) {
     // Great-circle destination point on a sphere.
@@ -1488,8 +1494,8 @@ fn egui_stats_system(
                 ui.style_mut().spacing.button_padding = egui::vec2(10.0, 5.0);
 
                 if let Some((_entity, missile)) = missile_query.iter().next() {
-                    let moscow_ecef = geodetic_to_ecef(MOSCOW_LAT, MOSCOW_LON, 0.0);
-                    let dist_to_target = missile.position_ecef.distance(moscow_ecef) / 1000.0;
+                    let target_ecef = geodetic_to_ecef(DIEGO_GARCIA_LAT, DIEGO_GARCIA_LON, 0.0);
+                    let dist_to_target = missile.position_ecef.distance(target_ecef) / 1000.0;
                     let dist_from_start = missile.position_ecef.distance(missile.start_position_ecef) / 1000.0;
 
                     ui.heading(format!("Model: {}", missile.model.name()));

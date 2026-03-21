@@ -89,6 +89,66 @@
     "boost_loft_factor": 1.1
   },
   {
+    "name": "Kheibar Shekan",
+    "dry_mass": 1200.0,
+    "fuel_mass": 7800.0,
+    "burn_time": 95.0,
+    "area": 0.78,
+    "isp_sea_level": 248.0,
+    "isp_vacuum": 292.0,
+    "pitch_start_time": 10.0,
+    "pitch_turn_rate": 0.72,
+    "boost_loft_factor": 1.12
+  },
+  {
+    "name": "Emad",
+    "dry_mass": 2000.0,
+    "fuel_mass": 11500.0,
+    "burn_time": 120.0,
+    "area": 0.82,
+    "isp_sea_level": 238.0,
+    "isp_vacuum": 286.0,
+    "pitch_start_time": 10.0,
+    "pitch_turn_rate": 0.7,
+    "boost_loft_factor": 1.1
+  },
+  {
+    "name": "Dezful",
+    "dry_mass": 900.0,
+    "fuel_mass": 5200.0,
+    "burn_time": 80.0,
+    "area": 0.52,
+    "isp_sea_level": 242.0,
+    "isp_vacuum": 286.0,
+    "pitch_start_time": 8.0,
+    "pitch_turn_rate": 0.62,
+    "boost_loft_factor": 1.06
+  },
+  {
+    "name": "Raad-500",
+    "dry_mass": 700.0,
+    "fuel_mass": 3500.0,
+    "burn_time": 68.0,
+    "area": 0.42,
+    "isp_sea_level": 245.0,
+    "isp_vacuum": 290.0,
+    "pitch_start_time": 7.0,
+    "pitch_turn_rate": 0.58,
+    "boost_loft_factor": 1.04
+  },
+  {
+    "name": "Fattah-2 (HGV concept)",
+    "dry_mass": 2200.0,
+    "fuel_mass": 9800.0,
+    "burn_time": 100.0,
+    "area": 0.85,
+    "isp_sea_level": 252.0,
+    "isp_vacuum": 298.0,
+    "pitch_start_time": 11.0,
+    "pitch_turn_rate": 0.78,
+    "boost_loft_factor": 1.15
+  },
+  {
     "name": "LGM-30G Minuteman III (USA)",
     "dry_mass": 1300.0,
     "fuel_mass": 0.0,

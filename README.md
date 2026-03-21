@@ -44,6 +44,18 @@ Simply running without arguments launches the default **Khorramshahr-4**:
 cargo run --release
 ```
 
+### In-sim fuel sweep (balancing / what-if)
+
+Native-only helper: search `fuel_mass` (fixed `burn_time`, so thrust ∝ fuel) for a trajectory that lands within a great-circle radius of the **default in-game target** (Diego Garcia), using the same integrator as the main app (fixed `dt`). This is for **game tuning only**, not a real-world range claim.
+
+```bash
+cargo run --release --bin fuel_sweep -- --help
+# Example:
+cargo run --release --bin fuel_sweep -- --radius-km 150 --step-kg 10000 --max-fuel-kg 5000000
+```
+
+If no value in the search window works, the tool prints the **best miss** it saw—many vehicles cannot steer enough in this model to close very large cross-range errors, no matter how much fuel is added.
+
 ## 🌐 WebAssembly (WASM)
 
 A GitHub Action (`.github/workflows/deploy-wasm.yml`) builds the WASM app and deploys it to **GitHub Pages** on every push to `main`. Enable it in the repo under **Settings → Pages → Build and deployment → Source**: choose **GitHub Actions**. The live app will be at `https://<user>.github.io/<repo>/`.
@@ -74,7 +86,7 @@ You can also build and run locally:
 
 ## 🌍 Simulation Domain
 
-The simulation tracks trajectories from launch sites (defaulting to Tehran) to global targets (defaulting to Moscow), accounting for Earth's rotation and varying atmospheric density.
+The simulation tracks trajectories from launch sites (defaulting to Tehran) to global targets (defaulting to Diego Garcia), accounting for Earth's rotation and varying atmospheric density.
 
 ---
 *Built with ❤️ by the AIBallistic Team*
