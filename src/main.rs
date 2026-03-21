@@ -101,13 +101,40 @@ struct MissileFlightHistory {
     pub altitude: Vec<[f64; 2]>,
 }
 
-/// WASM-only: trail markers (small spheres) for trajectory when Gizmos don't render on web.
+/// WASM-only: mesh markers (Gizmos are unreliable in WebGL builds).
 #[cfg(target_arch = "wasm32")]
 #[derive(Component)]
 struct TrailMarker;
 #[cfg(target_arch = "wasm32")]
 #[derive(Resource, Default)]
 struct TrajectoryTrailMarkers(pub Option<Vec<Entity>>);
+/// Single sphere following the missile (Gizmo stand-in).
+#[cfg(target_arch = "wasm32")]
+#[derive(Resource, Default)]
+struct WasmMissileHeadEntity(pub Option<Entity>);
+/// Four mesh markers for `GeoSiteId::ALL` (launch / aim presets).
+#[cfg(target_arch = "wasm32")]
+#[derive(Resource, Default)]
+struct WasmSiteEntities(pub Option<[Entity; 4]>);
+/// One sphere per ABM interceptor (rebuilt each frame).
+#[cfg(target_arch = "wasm32")]
+#[derive(Resource, Default)]
+struct WasmAbmEntities(pub Vec<Entity>);
+/// MIRV / reentry body markers (rebuilt each frame).
+#[cfg(target_arch = "wasm32")]
+#[derive(Resource, Default)]
+struct WasmReentryEntities(pub Vec<Entity>);
+
+/// Push overlays outward along the geocentric radial so they sit above the globe mesh (avoids z-fighting / inside-earth clipping in WebGL).
+#[cfg(target_arch = "wasm32")]
+fn wasm_raise_visible(pos: Vec3) -> Vec3 {
+    const LIFT: f32 = 220_000.0;
+    let n = pos.normalize_or_zero();
+    if n.length_squared() < 1e-6 {
+        return pos;
+    }
+    n * (pos.length() + LIFT)
+}
 
 #[derive(Component)]
 struct RadarStation {
@@ -284,6 +311,10 @@ fn main() {
         .init_resource::<ABMLaunchQueue>()
         .init_resource::<MirvDeploymentTracker>()
         .init_resource::<TrajectoryTrailMarkers>()
+        .init_resource::<WasmMissileHeadEntity>()
+        .init_resource::<WasmSiteEntities>()
+        .init_resource::<WasmAbmEntities>()
+        .init_resource::<WasmReentryEntities>()
         .add_systems(Startup, setup)
         .add_systems(EguiPrimaryContextPass, egui_stats_system)
         .add_systems(Update, (
@@ -291,7 +322,7 @@ fn main() {
             solar_lighting_system, radar_scan_system, earth_alignment_system,
             abm_c2_system, spawn_abm_system, abm_guidance_system, abm_kill_system, explosion_system,
             mirv_deployment_system, reentry_body_physics_system,
-            wasm_trajectory_trail_system,
+            wasm_visual_overlay_system,
         ))
         .run();
 }
@@ -1197,112 +1228,249 @@ fn trajectory_system(
     }
 }
 
-/// WASM: draw trajectory as small spheres so the track is visible when Gizmos don't render on web.
+/// WASM: mesh-based overlays (trajectory, missile head, scenario sites, ABM, MIRV) — WebGL often omits Gizmos.
 #[cfg(target_arch = "wasm32")]
-fn wasm_trajectory_trail_system(
+fn wasm_visual_overlay_system(
     mut commands: Commands,
-    missile_query: Query<&Missile>,
-    mut markers: ResMut<TrajectoryTrailMarkers>,
-    mut transforms: Query<&mut Transform, With<TrailMarker>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    missile_query: Query<&Missile>,
+    abm_query: Query<&ABMInterceptor>,
+    reentry_query: Query<&ReentryBody>,
+    scenario: Res<ScenarioSelection>,
+    mut trail_markers: ResMut<TrajectoryTrailMarkers>,
+    mut head_ent: ResMut<WasmMissileHeadEntity>,
+    mut site_ents: ResMut<WasmSiteEntities>,
+    mut abm_ents: ResMut<WasmAbmEntities>,
+    mut reentry_ents: ResMut<WasmReentryEntities>,
+    mut assets: Local<Option<WasmWebAssets>>,
 ) {
-    const N: usize = 50;
-    let missile = match missile_query.iter().next() {
-        Some(m) => m,
-        None => {
-            if let Some(entities) = markers.0.take() {
-                for e in entities {
-                    commands.entity(e).despawn();
-                }
-            }
-            return;
+    const N_TRAIL: usize = 50;
+    const R_TRAIL: f32 = 72_000.0;
+    const R_HEAD: f32 = 98_000.0;
+    const R_SITE: f32 = 78_000.0;
+    const R_ABM: f32 = 68_000.0;
+    const R_RV: f32 = 58_000.0;
+
+    let a = assets.get_or_insert_with(|| WasmWebAssets::new(&mut meshes, &mut materials));
+
+    // --- Scenario sites (always show so launch/aim points are visible) ---
+    if site_ents.0.is_none() {
+        site_ents.0 = Some(std::array::from_fn(|_| {
+            commands
+                .spawn((
+                    Mesh3d(a.sphere_mesh.clone()),
+                    MeshMaterial3d(a.site_gray.clone()),
+                    Transform::from_translation(Vec3::ZERO).with_scale(Vec3::splat(R_SITE)),
+                    Visibility::Visible,
+                ))
+                .id()
+        }));
+    }
+    if let Some(site_ids) = site_ents.0.as_ref() {
+        for (i, site) in GeoSiteId::ALL.into_iter().enumerate() {
+            let mat = if site == scenario.launch_site {
+                a.site_red.clone()
+            } else if site == scenario.target_site {
+                a.site_purple.clone()
+            } else {
+                a.site_gray.clone()
+            };
+            let p = wasm_raise_visible(site.aim_ecef().as_vec3());
+            commands.entity(site_ids[i]).insert((
+                MeshMaterial3d(mat),
+                Transform::from_translation(p).with_scale(Vec3::splat(R_SITE)),
+                Visibility::Visible,
+            ));
         }
+    }
+
+    // --- ABM interceptors ---
+    for e in abm_ents.0.drain(..) {
+        commands.entity(e).despawn();
+    }
+    for abm in abm_query.iter() {
+        let p = wasm_raise_visible(abm.position_ecef.as_vec3());
+        let id = commands
+            .spawn((
+                Mesh3d(a.sphere_mesh.clone()),
+                MeshMaterial3d(a.abm_lime.clone()),
+                Transform::from_translation(p).with_scale(Vec3::splat(R_ABM)),
+                Visibility::Visible,
+            ))
+            .id();
+        abm_ents.0.push(id);
+    }
+
+    // --- Reentry bodies (MIRV) ---
+    for e in reentry_ents.0.drain(..) {
+        commands.entity(e).despawn();
+    }
+    for body in reentry_query.iter() {
+        if body.phase == FlightPhase::Landed {
+            continue;
+        }
+        let mat = match body.body_type {
+            ReentryBodyType::Warhead => a.rv_warhead.clone(),
+            ReentryBodyType::Decoy => a.rv_decoy.clone(),
+        };
+        let p = wasm_raise_visible(body.position_ecef.as_vec3());
+        let id = commands
+            .spawn((
+                Mesh3d(a.sphere_mesh.clone()),
+                MeshMaterial3d(mat),
+                Transform::from_translation(p).with_scale(Vec3::splat(R_RV)),
+                Visibility::Visible,
+            ))
+            .id();
+        reentry_ents.0.push(id);
+    }
+
+    let Some(missile) = missile_query.iter().next() else {
+        if let Some(entities) = trail_markers.0.take() {
+            for e in entities {
+                commands.entity(e).despawn();
+            }
+        }
+        if let Some(he) = head_ent.0.take() {
+            commands.entity(he).despawn();
+        }
+        return;
     };
+
     let path = &missile.path;
     let start = missile.start_position_ecef.as_vec3();
     let current = missile.position_ecef.as_vec3();
 
     let positions: Vec<Vec3> = if path.len() >= 2 {
         let len = path.len();
-        (0..N)
+        (0..N_TRAIL)
             .map(|i| {
-                let idx = (i as f64 * (len - 1) as f64 / (N - 1).max(1) as f64) as usize;
-                path[idx.min(len - 1)].0
+                let idx = (i as f64 * (len - 1) as f64 / (N_TRAIL - 1).max(1) as f64) as usize;
+                wasm_raise_visible(path[idx.min(len - 1)].0)
             })
             .collect()
     } else {
-        // From first frame: show launch-to-current segment so track is visible immediately
-        (0..N)
+        (0..N_TRAIL)
             .map(|i| {
-                let t = i as f32 / (N - 1).max(1) as f32;
-                start.lerp(current, t)
+                let t = i as f32 / (N_TRAIL - 1).max(1) as f32;
+                wasm_raise_visible(start.lerp(current, t))
             })
             .collect()
     };
 
-    if path.len() < 2 && start.distance(current) < 1000.0 {
-        if let Some(entities) = markers.0.take() {
+    // Trail pool: recreate if count wrong; otherwise update transforms via commands (reliable with deferred spawn).
+    let need_trail = path.len() >= 2 || start.distance(current) > 50.0;
+    if !need_trail {
+        if let Some(entities) = trail_markers.0.take() {
             for e in entities {
                 commands.entity(e).despawn();
             }
         }
-        return;
-    }
-
-    const SPHERE_R: f32 = 45000.0;
-    let entities = if let Some(ent) = &mut markers.0 {
-        if ent.len() != N {
-            for e in ent.drain(..) {
-                commands.entity(e).despawn();
-            }
-            let sphere = meshes.add(Sphere::new(SPHERE_R).mesh().uv(8, 6));
-            let mat = materials.add(StandardMaterial {
-                base_color: bevy::color::Color::srgb(0.2, 0.8, 1.0),
-                unlit: true,
-                ..default()
-            });
-            let new_entities: Vec<Entity> = (0..N)
-                .map(|i| {
-                    commands
-                        .spawn((
-                            Mesh3d(sphere.clone()),
-                            MeshMaterial3d(mat.clone()),
-                            Transform::from_translation(positions[i]),
-                            TrailMarker,
-                        ))
-                        .id()
-                })
-                .collect();
-            *ent = new_entities;
-        }
-        ent.clone()
     } else {
-        let sphere = meshes.add(Sphere::new(SPHERE_R).mesh().uv(8, 6));
-        let mat = materials.add(StandardMaterial {
-            base_color: bevy::color::Color::srgb(0.2, 0.8, 1.0),
-            unlit: true,
-            ..default()
-        });
-        let new_entities: Vec<Entity> = (0..N)
-            .map(|i| {
-                commands
+        let recreate = match &trail_markers.0 {
+            None => true,
+            Some(v) => v.len() != N_TRAIL,
+        };
+        if recreate {
+            if let Some(old) = trail_markers.0.take() {
+                for e in old {
+                    commands.entity(e).despawn();
+                }
+            }
+            let mesh = a.sphere_mesh.clone();
+            let mat = a.trail.clone();
+            let mut ids = Vec::with_capacity(N_TRAIL);
+            for i in 0..N_TRAIL {
+                let id = commands
                     .spawn((
-                        Mesh3d(sphere.clone()),
+                        Mesh3d(mesh.clone()),
                         MeshMaterial3d(mat.clone()),
-                        Transform::from_translation(positions[i]),
+                        Transform::from_translation(positions[i]).with_scale(Vec3::splat(R_TRAIL)),
+                        Visibility::Visible,
                         TrailMarker,
                     ))
-                    .id()
-            })
-            .collect();
-        markers.0 = Some(new_entities.clone());
-        new_entities
-    };
+                    .id();
+                ids.push(id);
+            }
+            trail_markers.0 = Some(ids);
+        } else if let Some(ids) = trail_markers.0.as_ref() {
+            for (i, &e) in ids.iter().enumerate() {
+                let _ = commands.entity(e).insert(
+                    Transform::from_translation(positions[i]).with_scale(Vec3::splat(R_TRAIL)),
+                );
+            }
+        }
+    }
 
-    for (i, &pos) in positions.iter().enumerate() {
-        if let Ok(mut transform) = transforms.get_mut(entities[i]) {
-            transform.translation = pos;
+    // Missile head
+    let head_color = match missile.phase {
+        FlightPhase::Boost => a.head_boost.clone(),
+        FlightPhase::Ballistic => a.head_ballistic.clone(),
+        FlightPhase::ReEntry => a.head_reentry.clone(),
+        FlightPhase::Landed => a.head_landed.clone(),
+    };
+    let hp = wasm_raise_visible(current);
+    if head_ent.0.is_none() {
+        let id = commands
+            .spawn((
+                Mesh3d(a.sphere_mesh.clone()),
+                MeshMaterial3d(head_color.clone()),
+                Transform::from_translation(hp).with_scale(Vec3::splat(R_HEAD)),
+                Visibility::Visible,
+            ))
+            .id();
+        head_ent.0 = Some(id);
+    } else if let Some(he) = head_ent.0 {
+        let _ = commands.entity(he).insert((
+            MeshMaterial3d(head_color),
+            Transform::from_translation(hp).with_scale(Vec3::splat(R_HEAD)),
+            Visibility::Visible,
+        ));
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+struct WasmWebAssets {
+    sphere_mesh: Handle<Mesh>,
+    trail: Handle<StandardMaterial>,
+    head_boost: Handle<StandardMaterial>,
+    head_ballistic: Handle<StandardMaterial>,
+    head_reentry: Handle<StandardMaterial>,
+    head_landed: Handle<StandardMaterial>,
+    site_red: Handle<StandardMaterial>,
+    site_purple: Handle<StandardMaterial>,
+    site_gray: Handle<StandardMaterial>,
+    abm_lime: Handle<StandardMaterial>,
+    rv_warhead: Handle<StandardMaterial>,
+    rv_decoy: Handle<StandardMaterial>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl WasmWebAssets {
+    fn new(meshes: &mut Assets<Mesh>, materials: &mut Assets<StandardMaterial>) -> Self {
+        let sphere_mesh = meshes.add(Sphere::new(1.0).mesh().uv(10, 8));
+        let mut unlit = |r: f32, g: f32, b: f32| {
+            materials.add(StandardMaterial {
+                base_color: bevy::color::Color::srgb(r, g, b),
+                emissive: bevy::color::LinearRgba::rgb(r * 0.6, g * 0.6, b * 0.6),
+                unlit: true,
+                ..default()
+            })
+        };
+        Self {
+            sphere_mesh,
+            trail: unlit(0.25, 0.85, 1.0),
+            head_boost: unlit(1.0, 0.95, 0.2),
+            head_ballistic: unlit(0.2, 0.95, 0.95),
+            head_reentry: unlit(1.0, 0.25, 0.2),
+            head_landed: unlit(0.3, 1.0, 0.35),
+            site_red: unlit(1.0, 0.2, 0.2),
+            site_purple: unlit(0.75, 0.35, 1.0),
+            site_gray: unlit(0.35, 0.35, 0.38),
+            abm_lime: unlit(0.4, 1.0, 0.35),
+            rv_warhead: unlit(1.0, 0.35, 0.2),
+            rv_decoy: unlit(1.0, 0.85, 0.25),
         }
     }
 }
