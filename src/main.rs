@@ -125,15 +125,22 @@ struct WasmAbmEntities(pub Vec<Entity>);
 #[derive(Resource, Default)]
 struct WasmReentryEntities(pub Vec<Entity>);
 
-/// Push overlays outward along the geocentric radial so they sit above the globe mesh (avoids z-fighting / inside-earth clipping in WebGL).
+/// Map physics ECEF (same frame as `geodetic_to_ecef`) to world space so it matches the textured `Earth` entity (basis + texture longitude).
+#[inline]
+fn ecef_to_globe_world(earth: &Transform, ecef_like: Vec3) -> Vec3 {
+    earth.transform_point(ecef_like)
+}
+
+/// WASM mesh markers: same frame as globe, then nudged outward in world space to clear the sphere (WebGL depth).
 #[cfg(target_arch = "wasm32")]
-fn wasm_raise_visible(pos: Vec3) -> Vec3 {
-    const LIFT: f32 = 220_000.0;
-    let n = pos.normalize_or_zero();
-    if n.length_squared() < 1e-6 {
-        return pos;
+fn wasm_overlay_world(earth: &Transform, ecef_like: Vec3) -> Vec3 {
+    const LIFT: f32 = 75_000.0;
+    let w = ecef_to_globe_world(earth, ecef_like);
+    let n = w.normalize_or_zero();
+    if n.length_squared() < 1e-12 {
+        return w;
     }
-    n * (pos.length() + LIFT)
+    w + n * LIFT
 }
 
 #[derive(Component)]
@@ -281,8 +288,8 @@ fn main() {
         .add_systems(Startup, setup)
         .add_systems(EguiPrimaryContextPass, egui_stats_system)
         .add_systems(Update, (
-            physics_system, trajectory_system, camera_system, input_system, 
-            solar_lighting_system, radar_scan_system, impact_prediction_system, earth_alignment_system,
+            physics_system, earth_alignment_system, trajectory_system, camera_system, input_system, 
+            solar_lighting_system, radar_scan_system, impact_prediction_system,
             abm_c2_system, spawn_abm_system, abm_guidance_system, abm_kill_system, explosion_system,
             mirv_deployment_system, reentry_body_physics_system,
         ))
@@ -318,8 +325,8 @@ fn main() {
         .add_systems(Startup, setup)
         .add_systems(EguiPrimaryContextPass, egui_stats_system)
         .add_systems(Update, (
-            physics_system, trajectory_system, camera_system, input_system, 
-            solar_lighting_system, radar_scan_system, earth_alignment_system,
+            physics_system, earth_alignment_system, trajectory_system, camera_system, input_system, 
+            solar_lighting_system, radar_scan_system,
             abm_c2_system, spawn_abm_system, abm_guidance_system, abm_kill_system, explosion_system,
             mirv_deployment_system, reentry_body_physics_system,
             wasm_visual_overlay_system,
@@ -1039,6 +1046,7 @@ fn explosion_system(
 
 fn trajectory_system(
     mut gizmos: Gizmos,
+    earth_q: Query<&Transform, With<Earth>>,
     query: Query<&Missile>,
     reentry_query: Query<&ReentryBody>,
     radar_query: Query<&RadarStation>,
@@ -1048,9 +1056,14 @@ fn trajectory_system(
     settings: Res<SimulationSettings>,
     scenario: Res<ScenarioSelection>,
 ) {
+    let Ok(earth) = earth_q.single() else {
+        return;
+    };
+    let w = |v: Vec3| ecef_to_globe_world(&earth, v);
+
     // Scenario sites (larger markers for selected launch / aim point)
     for site in GeoSiteId::ALL {
-        let p = site.aim_ecef().as_vec3();
+        let p = w(site.aim_ecef().as_vec3());
         let (radius, color) = if site == scenario.launch_site {
             (55_000.0f32, bevy::color::palettes::css::RED)
         } else if site == scenario.target_site {
@@ -1064,20 +1077,17 @@ fn trajectory_system(
     // Radar Stations
     if settings.show_radar_coverage {
         for radar in radar_query.iter() {
-            // Draw radar station
-            gizmos.sphere(radar.position_ecef.as_vec3(), 75000.0, bevy::color::palettes::css::BLUE);
+            gizmos.sphere(w(radar.position_ecef.as_vec3()), 75000.0, bevy::color::palettes::css::BLUE);
         }
     }
 
     // Defended Zones
     for zone in defended_zones.iter() {
-        let p_vec = zone.position_ecef.as_vec3();
+        let p_vec = w(zone.position_ecef.as_vec3());
         let up = p_vec.normalize();
-        
-        // Draw the zone origin point
+
         gizmos.sphere(p_vec, 30_000.0, bevy::color::palettes::css::GREEN);
-        
-        // Draw the protective radius
+
         gizmos.circle(
             Isometry3d::new(p_vec, Quat::from_rotation_arc(Vec3::Z, up)),
             zone.radius as f32,
@@ -1087,87 +1097,89 @@ fn trajectory_system(
 
     // Active Interceptors
     for abm in interceptor_query.iter() {
-        // Draw the interceptor tracking marker
-        gizmos.sphere(abm.position_ecef.as_vec3(), 40_000.0, bevy::color::palettes::css::LIME);
+        gizmos.sphere(w(abm.position_ecef.as_vec3()), 40_000.0, bevy::color::palettes::css::LIME);
     }
 
     // Impact Prediction (CEP Scatter Visualization)
     if !prediction.coordinates_ecef.is_empty() {
         let mut centroid = DVec3::ZERO;
-        
-        // Draw individual prediction points in the swarm
+
         for p in &prediction.coordinates_ecef {
             centroid += *p;
-            gizmos.sphere(p.as_vec3(), 15000.0, bevy::color::palettes::css::ORANGE);
+            gizmos.sphere(w(p.as_vec3()), 15000.0, bevy::color::palettes::css::ORANGE);
         }
-        
+
         centroid /= prediction.coordinates_ecef.len() as f64;
-        
-        // Calculate 50% radius (CEP)
-        let mut distances: Vec<f64> = prediction.coordinates_ecef.iter()
+
+        let mut distances: Vec<f64> = prediction
+            .coordinates_ecef
+            .iter()
             .map(|p| p.distance(centroid))
             .collect();
-        // Sort distances to find median for CEP definition
-        // We use sort_by directly since floats can't be purely fully ordered, but this is safe here
         distances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        
+
         let cep_radius = distances[distances.len() / 2];
-        
-        // Draw the CEP boundary circle
-        let p_vec = centroid.as_vec3();
-        let up = p_vec.normalize();
+
+        let c_w = w(centroid.as_vec3());
+        let up = c_w.normalize();
         let right = up.cross(Vec3::Y).normalize_or_zero();
         let fwd = up.cross(right).normalize_or_zero();
-        
-        // Draw a multi-segment circle utilizing lines for gizmos approximation
+
         let segments = 32;
         let first_point = {
             let angle: f32 = 0.0;
-            p_vec + (right * angle.cos() + fwd * angle.sin()) * cep_radius as f32
+            c_w + (right * angle.cos() + fwd * angle.sin()) * cep_radius as f32
         };
         let mut prev_point: Option<Vec3> = Some(first_point);
-        
+
         for i in 0..=segments {
             let angle = (i as f32 / segments as f32) * std::f32::consts::TAU;
-            let cur_point = p_vec + (right * angle.cos() + fwd * angle.sin()) * cep_radius as f32;
-            
+            let cur_point = c_w + (right * angle.cos() + fwd * angle.sin()) * cep_radius as f32;
+
             if let Some(prev) = prev_point {
                 gizmos.line(prev, cur_point, bevy::color::palettes::css::RED);
             }
             prev_point = Some(cur_point);
         }
-        
-        // Close the circle
+
         if let Some(prev) = prev_point {
             gizmos.line(prev, first_point, bevy::color::palettes::css::RED);
         }
-        
-        // Pulsate the main centroid marker
-        let time_sec = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
-        let pulse = (time_sec * 5.0).sin() as f32; // -1 to 1
+
+        let time_sec = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let pulse = (time_sec * 5.0).sin() as f32;
         let center_radius = 40000.0 + (pulse * 15000.0);
-        
-        gizmos.sphere(p_vec, center_radius, bevy::color::palettes::css::RED);
-        
-        // X marker
+
+        gizmos.sphere(c_w, center_radius, bevy::color::palettes::css::RED);
+
         let cross_size = 150000.0;
-        gizmos.line(p_vec - right * cross_size, p_vec + right * cross_size, bevy::color::palettes::css::RED);
-        gizmos.line(p_vec - fwd * cross_size, p_vec + fwd * cross_size, bevy::color::palettes::css::RED);
+        gizmos.line(
+            c_w - right * cross_size,
+            c_w + right * cross_size,
+            bevy::color::palettes::css::RED,
+        );
+        gizmos.line(
+            c_w - fwd * cross_size,
+            c_w + fwd * cross_size,
+            bevy::color::palettes::css::RED,
+        );
     }
 
     for missile in query.iter() {
-        let pos = missile.position_ecef.as_vec3();
+        let pos = w(missile.position_ecef.as_vec3());
         let head_color = match missile.phase {
             FlightPhase::Boost => bevy::color::palettes::css::YELLOW,
             FlightPhase::Ballistic => bevy::color::palettes::css::AQUA,
             FlightPhase::ReEntry => bevy::color::palettes::css::RED,
             FlightPhase::Landed => bevy::color::palettes::css::GREEN,
         };
-        // Bevy 0.17 gizmos.sphere(position, radius, color)
         gizmos.sphere(pos, 50000.0, head_color);
 
-        // Draw track: always show at least launch-to-current so track is visible from startup
         let start_pos = missile.start_position_ecef.as_vec3();
+        let pos_raw = missile.position_ecef.as_vec3();
         if missile.path.len() > 1 {
             for i in 0..missile.path.len() - 1 {
                 let (p1, phase1) = missile.path[i];
@@ -1178,7 +1190,7 @@ fn trajectory_system(
                     FlightPhase::ReEntry => bevy::color::palettes::css::RED,
                     FlightPhase::Landed => bevy::color::palettes::css::GREEN,
                 };
-                gizmos.line(p1, p2, color);
+                gizmos.line(w(p1), w(p2), color);
             }
             if let Some((last_pos, last_phase)) = missile.path.last() {
                 let color = match last_phase {
@@ -1187,20 +1199,19 @@ fn trajectory_system(
                     FlightPhase::ReEntry => bevy::color::palettes::css::RED,
                     FlightPhase::Landed => bevy::color::palettes::css::GREEN,
                 };
-                gizmos.line(*last_pos, pos, color);
+                gizmos.line(w(*last_pos), pos, color);
             }
-        } else {
-            // Before we have 2 path points, draw launch-to-current so track is visible immediately
-            if start_pos.distance(pos) > 1000.0 {
-                gizmos.line(start_pos, pos, head_color);
-            }
+        } else if start_pos.distance(pos_raw) > 1000.0 {
+            gizmos.line(w(start_pos), pos, head_color);
         }
     }
 
     // Reentry bodies (MIRV warheads & decoys)
     for body in reentry_query.iter() {
-        let pos = body.position_ecef.as_vec3();
-        if body.phase == FlightPhase::Landed { continue; }
+        let pos = w(body.position_ecef.as_vec3());
+        if body.phase == FlightPhase::Landed {
+            continue;
+        }
 
         let (head_color, trail_color, size) = match body.body_type {
             ReentryBodyType::Warhead => (
@@ -1219,10 +1230,14 @@ fn trajectory_system(
 
         if body.path.len() > 1 {
             for i in 0..body.path.len() - 1 {
-                gizmos.line(body.path[i].0, body.path[i + 1].0, trail_color);
+                gizmos.line(
+                    w(body.path[i].0),
+                    w(body.path[i + 1].0),
+                    trail_color,
+                );
             }
             if let Some((last_pos, _)) = body.path.last() {
-                gizmos.line(*last_pos, pos, trail_color);
+                gizmos.line(w(*last_pos), pos, trail_color);
             }
         }
     }
@@ -1234,6 +1249,7 @@ fn wasm_visual_overlay_system(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    earth_q: Query<&Transform, With<Earth>>,
     missile_query: Query<&Missile>,
     abm_query: Query<&ABMInterceptor>,
     reentry_query: Query<&ReentryBody>,
@@ -1251,6 +1267,10 @@ fn wasm_visual_overlay_system(
     const R_SITE: f32 = 78_000.0;
     const R_ABM: f32 = 68_000.0;
     const R_RV: f32 = 58_000.0;
+
+    let Ok(earth) = earth_q.single() else {
+        return;
+    };
 
     let a = assets.get_or_insert_with(|| WasmWebAssets::new(&mut meshes, &mut materials));
 
@@ -1276,7 +1296,7 @@ fn wasm_visual_overlay_system(
             } else {
                 a.site_gray.clone()
             };
-            let p = wasm_raise_visible(site.aim_ecef().as_vec3());
+            let p = wasm_overlay_world(&earth, site.aim_ecef().as_vec3());
             commands.entity(site_ids[i]).insert((
                 MeshMaterial3d(mat),
                 Transform::from_translation(p).with_scale(Vec3::splat(R_SITE)),
@@ -1290,7 +1310,7 @@ fn wasm_visual_overlay_system(
         commands.entity(e).despawn();
     }
     for abm in abm_query.iter() {
-        let p = wasm_raise_visible(abm.position_ecef.as_vec3());
+        let p = wasm_overlay_world(&earth, abm.position_ecef.as_vec3());
         let id = commands
             .spawn((
                 Mesh3d(a.sphere_mesh.clone()),
@@ -1314,7 +1334,7 @@ fn wasm_visual_overlay_system(
             ReentryBodyType::Warhead => a.rv_warhead.clone(),
             ReentryBodyType::Decoy => a.rv_decoy.clone(),
         };
-        let p = wasm_raise_visible(body.position_ecef.as_vec3());
+        let p = wasm_overlay_world(&earth, body.position_ecef.as_vec3());
         let id = commands
             .spawn((
                 Mesh3d(a.sphere_mesh.clone()),
@@ -1347,14 +1367,14 @@ fn wasm_visual_overlay_system(
         (0..N_TRAIL)
             .map(|i| {
                 let idx = (i as f64 * (len - 1) as f64 / (N_TRAIL - 1).max(1) as f64) as usize;
-                wasm_raise_visible(path[idx.min(len - 1)].0)
+                wasm_overlay_world(&earth, path[idx.min(len - 1)].0)
             })
             .collect()
     } else {
         (0..N_TRAIL)
             .map(|i| {
                 let t = i as f32 / (N_TRAIL - 1).max(1) as f32;
-                wasm_raise_visible(start.lerp(current, t))
+                wasm_overlay_world(&earth, start.lerp(current, t))
             })
             .collect()
     };
@@ -1410,7 +1430,7 @@ fn wasm_visual_overlay_system(
         FlightPhase::ReEntry => a.head_reentry.clone(),
         FlightPhase::Landed => a.head_landed.clone(),
     };
-    let hp = wasm_raise_visible(current);
+    let hp = wasm_overlay_world(&earth, current);
     if head_ent.0.is_none() {
         let id = commands
             .spawn((
