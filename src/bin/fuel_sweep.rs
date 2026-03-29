@@ -4,7 +4,8 @@
 //! Run from the repo root: `cargo run --release --bin fuel_sweep`
 
 use aiballistic::missiles::{
-    geodetic_to_ecef, get_missile_registry, MissileSpecs, DIEGO_GARCIA_LAT, DIEGO_GARCIA_LON,
+    geodetic_to_ecef, get_missile_registry, BoostPitchConfig, MissileSpecs, DIEGO_GARCIA_LAT,
+    DIEGO_GARCIA_LON,
 };
 use aiballistic::sim::{simulate_until_ground_impact, SimParams};
 
@@ -33,7 +34,8 @@ Options:
   --no-centrifugal       Disable centrifugal term
 
 Notes:
-  - Uses the same thrust model as the game: burn_rate = fuel_mass / burn_time (fixed burn_time).
+  - Uses the same thrust model as the game: variable ṁ(t) with solid-motor profile, thrust from
+    vacuum momentum term minus ambient pressure correction (see `rocket_thrust_newton` in missiles.rs).
   - \"Hit\" is not guaranteed monotonic in fuel; this tool steps fuel and reports the first
     threshold crossing when increasing from baseline, or the lowest fuel (by step) when decreasing.
 "
@@ -108,8 +110,8 @@ fn main() {
     let registry = get_missile_registry();
     let base = find_specs(&registry, &missile_name).clone();
 
-    if base.is_multistage() {
-        eprintln!("fuel_sweep currently supports single-stage JSON entries only.");
+    if base.is_multistage() || base.stages.is_empty() {
+        eprintln!("fuel_sweep: use a missile with exactly one boost stage in `stages` (not multistage).");
         std::process::exit(1);
     }
 
@@ -123,12 +125,13 @@ fn main() {
     };
 
     let radius_m = radius_km * 1000.0;
-    let base_fuel = base.fuel_mass;
+    let base_fuel = base.stages[0].fuel_mass;
 
+    let pitch = BoostPitchConfig::default();
     let run = |fuel: f64| {
         let mut s = base.clone();
-        s.fuel_mass = fuel;
-        simulate_until_ground_impact(s, launch, target_ecef, &params)
+        s.stages[0].fuel_mass = fuel;
+        simulate_until_ground_impact(s, launch, target_ecef, &pitch, &params)
     };
 
     let baseline = run(base_fuel);

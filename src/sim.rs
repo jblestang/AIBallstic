@@ -3,9 +3,9 @@
 use glam::DVec3;
 
 use crate::missiles::{
-    BallisticMissilePhysics, EARTH_OMEGA, EARTH_RADIUS, FlightPhase, GRAVITY_CONSTANT, MissileSpecs,
-    PhysicsModel,
+    BallisticMissilePhysics, BoostPitchConfig, FlightPhase, MissileSpecs, PhysicsModel,
 };
+use crate::physics::{ecef_to_geodetic_deg, ellipsoid_height_m, EARTH_RADIUS};
 
 /// Settings for offline runs (game UI uses variable frame `dt` × `time_scale`; this is fixed-`dt`).
 #[derive(Debug, Clone)]
@@ -32,23 +32,12 @@ impl Default for SimParams {
 pub struct GroundImpactResult {
     pub landed: bool,
     pub flight_time_s: f32,
-    /// Last integrated position (may be slightly inside the sphere when `landed`).
+    /// Last integrated position (may be slightly below the ellipsoid when `landed`).
     pub position_ecef: DVec3,
     pub impact_lat_deg: f64,
     pub impact_lon_deg: f64,
     /// Great-circle miss distance to the aim point used in `BallisticMissilePhysics`.
     pub miss_distance_m: f64,
-}
-
-/// Inverse of `geodetic_to_ecef` for the game's ECEF convention.
-pub fn ecef_to_geodetic_deg(p: DVec3) -> (f64, f64) {
-    let r = p.length();
-    if r < 1.0 {
-        return (0.0, 0.0);
-    }
-    let lat = (p.y / r).clamp(-1.0, 1.0).asin().to_degrees();
-    let lon = p.z.atan2(-p.x).to_degrees();
-    (lat, lon)
 }
 
 fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
@@ -62,14 +51,15 @@ fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     r * c
 }
 
-/// Integrate until the missile intersects the spherical Earth (`r < EARTH_RADIUS` after 1 s), or `max_time_s`.
+/// Integrate until ellipsoid height ≤ 0 (WGS84 ground) after 1 s, or `max_time_s`.
 pub fn simulate_until_ground_impact(
     specs: MissileSpecs,
     launch_ecef: DVec3,
     target_ecef: DVec3,
+    pitch: &BoostPitchConfig,
     params: &SimParams,
 ) -> GroundImpactResult {
-    let model = BallisticMissilePhysics::new(specs, target_ecef);
+    let model = BallisticMissilePhysics::new(specs, target_ecef, *pitch);
     let (tgt_lat, tgt_lon) = ecef_to_geodetic_deg(target_ecef);
     let dt = params.dt as f32;
 
@@ -80,8 +70,7 @@ pub fn simulate_until_ground_impact(
     let mut _phase = FlightPhase::Boost;
 
     while timer < params.max_time_s {
-        let r = pos.length();
-        if r < EARTH_RADIUS && timer > 1.0 {
+        if ellipsoid_height_m(pos) <= 0.0 && timer > 1.0 {
             let (lat, lon) = ecef_to_geodetic_deg(pos);
             let miss = haversine_m(lat, lon, tgt_lat, tgt_lon);
             return GroundImpactResult {
@@ -94,30 +83,15 @@ pub fn simulate_until_ground_impact(
             };
         }
 
-        let gravity_dir = -pos.normalize();
-        let gravity_accel = gravity_dir * (GRAVITY_CONSTANT / (r * r));
-
-        let coriolis_accel = if params.coriolis_enabled {
-            -2.0 * EARTH_OMEGA.cross(vel)
-        } else {
-            DVec3::ZERO
-        };
-
-        let centrifugal_accel = if params.centrifugal_enabled {
-            -EARTH_OMEGA.cross(EARTH_OMEGA.cross(pos))
-        } else {
-            DVec3::ZERO
-        };
-
-        let (model_accel, new_phase, mass_delta) =
-            model.compute_acceleration(pos, vel, mass, timer, dt);
-        _phase = new_phase;
-        mass += mass_delta;
-        timer += dt;
-
-        let total_accel = gravity_accel + coriolis_accel + centrifugal_accel + model_accel;
-        vel += total_accel * dt as f64;
-        pos += vel * dt as f64;
+        _phase = model.dopri5_substep(
+            &mut pos,
+            &mut vel,
+            &mut mass,
+            &mut timer,
+            dt,
+            params.coriolis_enabled,
+            params.centrifugal_enabled,
+        );
     }
 
     let (lat, lon) = ecef_to_geodetic_deg(pos);
@@ -129,5 +103,81 @@ pub fn simulate_until_ground_impact(
         impact_lat_deg: lat,
         impact_lon_deg: lon,
         miss_distance_m: miss,
+    }
+}
+
+/// Result of integrating a full trajectory for analysis (nomograms, etc.).
+#[derive(Debug, Clone)]
+pub struct TrajectoryMetrics {
+    pub landed: bool,
+    /// Great-circle distance from launch point to impact (km).
+    pub ground_range_km: f64,
+    /// Maximum WGS84 ellipsoidal altitude along the path (km).
+    pub apogee_km: f64,
+    pub flight_time_s: f32,
+}
+
+/// Faster integration for batch scans (abbaques); still matches `simulate_until_ground_impact` physics.
+pub fn nomogram_sim_params() -> SimParams {
+    SimParams {
+        dt: 0.025,
+        coriolis_enabled: true,
+        centrifugal_enabled: true,
+        max_time_s: 12_000.0,
+    }
+}
+
+/// Integrate trajectory; track apogee and ground range (launch → impact). Same forces as `simulate_until_ground_impact`.
+pub fn simulate_trajectory_metrics(
+    specs: MissileSpecs,
+    launch_ecef: DVec3,
+    target_ecef: DVec3,
+    pitch: &BoostPitchConfig,
+    params: &SimParams,
+) -> TrajectoryMetrics {
+    let (launch_lat, launch_lon) = ecef_to_geodetic_deg(launch_ecef);
+    let model = BallisticMissilePhysics::new(specs, target_ecef, *pitch);
+    let dt = params.dt as f32;
+
+    let mut pos = launch_ecef;
+    let mut vel = DVec3::ZERO;
+    let mut mass = model.specs().total_mass();
+    let mut timer = 0.0f32;
+    let mut max_h = 0.0f64;
+
+    while timer < params.max_time_s {
+        max_h = max_h.max(ellipsoid_height_m(pos));
+
+        if ellipsoid_height_m(pos) <= 0.0 && timer > 1.0 {
+            let (lat, lon) = ecef_to_geodetic_deg(pos);
+            let range_m = haversine_m(launch_lat, launch_lon, lat, lon);
+            return TrajectoryMetrics {
+                landed: true,
+                ground_range_km: range_m / 1000.0,
+                apogee_km: max_h / 1000.0,
+                flight_time_s: timer,
+            };
+        }
+
+        let _phase = model.dopri5_substep(
+            &mut pos,
+            &mut vel,
+            &mut mass,
+            &mut timer,
+            dt,
+            params.coriolis_enabled,
+            params.centrifugal_enabled,
+        );
+        max_h = max_h.max(ellipsoid_height_m(pos));
+    }
+
+    max_h = max_h.max(ellipsoid_height_m(pos));
+    let (lat, lon) = ecef_to_geodetic_deg(pos);
+    let range_m = haversine_m(launch_lat, launch_lon, lat, lon);
+    TrajectoryMetrics {
+        landed: false,
+        ground_range_km: range_m / 1000.0,
+        apogee_km: max_h / 1000.0,
+        flight_time_s: timer,
     }
 }

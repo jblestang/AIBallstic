@@ -1,4 +1,6 @@
 use aiballistic::missiles::*;
+use aiballistic::physics::{dopri5_step_6, inertial_accelerations};
+use aiballistic::sim::{nomogram_sim_params, simulate_trajectory_metrics};
 
 use bevy::prelude::*;
 use bevy::window::{Window, WindowPlugin};
@@ -6,7 +8,28 @@ use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 use glam::{DVec3, Vec3};
 use nalgebra::{SMatrix, SVector};
 use std::f32::consts::PI;
+use std::sync::OnceLock;
 use chrono::{Datelike, Timelike, Utc};
+
+/// Set `AIBALLISTIC_DEBUG=1` (or `true`) to print missile / trajectory diagnostics to stderr.
+fn aiballistic_debug_log_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("AIBALLISTIC_DEBUG")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    })
+}
+
+#[inline]
+fn log_ground_impact_debug(branch: &'static str, timer: f32, h_m: f64) {
+    if !aiballistic_debug_log_enabled() {
+        return;
+    }
+    eprintln!(
+        "[AIBallistic DEBUG] ground_impact branch={branch} sim_t={timer:.3}s h_ellipsoid={h_m:.2}m"
+    );
+}
 
 // Constants
 // Real-world alignment is handled in missiles.rs constants
@@ -54,6 +77,8 @@ struct SimulationSettings {
     centrifugal_enabled: bool,
     show_radar_coverage: bool,
     texture_lon_offset: f32,
+    /// Tangage boost (hors `missiles.json`).
+    boost_pitch: BoostPitchConfig,
 }
 
 #[derive(Resource)]
@@ -68,6 +93,58 @@ struct ScenarioSelection {
     launch_site: GeoSiteId,
     target_site: GeoSiteId,
     missile_index: usize,
+}
+
+/// Paramètre balayé pour les abbaques (angles de guidage boost).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum NomogramSweepParam {
+    /// Élévation au début de la rampe (après pitch_start_time).
+    #[default]
+    InitialElevationDeg,
+    /// Élévation en fin de rampe.
+    EndElevationDeg,
+}
+
+impl NomogramSweepParam {
+    fn label(self) -> &'static str {
+        match self {
+            NomogramSweepParam::InitialElevationDeg => "élévation initiale (°)",
+            NomogramSweepParam::EndElevationDeg => "élévation finale (°)",
+        }
+    }
+}
+
+#[derive(Resource)]
+struct NomogramState {
+    window_open: bool,
+    sweep: NomogramSweepParam,
+    param_min: f64,
+    param_max: f64,
+    steps: usize,
+    /// (paramètre, portée km, apogée km)
+    series: Vec<(f64, f64, f64)>,
+    status: String,
+}
+
+impl Default for NomogramState {
+    fn default() -> Self {
+        Self {
+            window_open: false,
+            sweep: NomogramSweepParam::default(),
+            param_min: 30.0,
+            param_max: 60.0,
+            steps: 24,
+            series: Vec::new(),
+            status: String::new(),
+        }
+    }
+}
+
+/// Regroupe l’état UI secondaire pour limiter le nombre de paramètres du système egui (plafond Bevy).
+#[derive(Resource, Default)]
+struct EguiUiState {
+    missile_db_first_frame: bool,
+    nomogram: NomogramState,
 }
 
 // Radar Tracking Resources
@@ -280,6 +357,7 @@ fn main() {
             centrifugal_enabled: true,
             show_radar_coverage: true,
             texture_lon_offset: 0.0, // Base UV mathematically aligns perfectly
+            boost_pitch: BoostPitchConfig::default(),
         })
         .init_resource::<TrackedMissileState>()
         .init_resource::<ImpactPrediction>()
@@ -287,6 +365,7 @@ fn main() {
         .init_resource::<MissileFlightHistory>()
         .init_resource::<ABMLaunchQueue>()
         .init_resource::<MirvDeploymentTracker>()
+        .init_resource::<EguiUiState>()
         .add_systems(Startup, setup)
         .add_systems(EguiPrimaryContextPass, egui_stats_system)
         .add_systems(Update, (
@@ -313,6 +392,7 @@ fn main() {
             centrifugal_enabled: true,
             show_radar_coverage: true,
             texture_lon_offset: 0.0, // Base UV mathematically aligns perfectly
+            boost_pitch: BoostPitchConfig::default(),
         })
         .init_resource::<TrackedMissileState>()
         .init_resource::<ImpactPrediction>()
@@ -324,6 +404,7 @@ fn main() {
         .init_resource::<WasmSiteEntities>()
         .init_resource::<WasmAbmEntities>()
         .init_resource::<WasmReentryEntities>()
+        .init_resource::<EguiUiState>()
         .add_systems(Startup, setup)
         .add_systems(EguiPrimaryContextPass, egui_stats_system)
         .add_systems(Update, (
@@ -343,6 +424,7 @@ fn setup(
     asset_server: Res<AssetServer>,
     active_specs: Res<ActiveMissileSpecs>,
     scenario: Res<ScenarioSelection>,
+    settings: Res<SimulationSettings>,
 ) {
     // Earth (North Pole at +Y, Prime Meridian at +X)
     commands.spawn((
@@ -402,7 +484,24 @@ fn setup(
         radius: 300_000.0, // 300 km point-defense radius
     });
 
-    spawn_missile_with_scenario(&mut commands, &active_specs, &scenario);
+    spawn_missile_with_scenario(&mut commands, &active_specs, &scenario, &settings.boost_pitch);
+
+    if aiballistic_debug_log_enabled() {
+        let bp = &settings.boost_pitch;
+        eprintln!(
+            "[AIBallistic DEBUG] setup missile={} launch={:?} target={:?} time_scale={} coriolis={} centrifugal={}",
+            active_specs.0.name,
+            scenario.launch_site,
+            scenario.target_site,
+            settings.time_scale,
+            settings.coriolis_enabled,
+            settings.centrifugal_enabled
+        );
+        eprintln!(
+            "[AIBallistic DEBUG] boost_pitch: pitch_start_time={}s pitch_exponent={} initial_el={}° end_el={}°",
+            bp.pitch_start_time, bp.pitch_exponent, bp.initial_elevation_deg, bp.end_elevation_deg
+        );
+    }
 
     // Camera
     commands.spawn((
@@ -417,80 +516,124 @@ fn physics_system(
     settings: Res<SimulationSettings>,
     mut query: Query<&mut Missile>,
     mut flight_history: ResMut<MissileFlightHistory>,
+    mut debug_log_accum: Local<f32>,
 ) {
-    let dt = time.delta_secs() * settings.time_scale;
+    let frame_dt = time.delta_secs() * settings.time_scale;
+
+    let debug = aiballistic_debug_log_enabled();
+    if debug {
+        *debug_log_accum += time.delta_secs();
+    }
+    let emit_periodic_debug = debug && *debug_log_accum >= 0.25;
+    if emit_periodic_debug {
+        *debug_log_accum = 0.0;
+    }
+
+    // Below this ellipsoidal height (m), split the frame into substeps so we do not
+    // tunnel through dense air at hypersonic speed — otherwise impact Mach stays unrealistically high.
+    const REENTRY_SUBSTEP_ALT_M: f64 = 45_000.0;
+    const REENTRY_SUBSTEP_SPEED_M_S: f64 = 350.0;
+    const REENTRY_SUBSTEPS: usize = 10;
 
     for mut missile in query.iter_mut() {
         if missile.phase == FlightPhase::Landed { continue; }
 
-        let r = missile.position_ecef.length();
-        if r < EARTH_RADIUS && missile.timer > 1.0 {
-             missile.velocity_ecef = DVec3::ZERO;
-             missile.phase = FlightPhase::Landed;
-             continue;
+        if ellipsoid_height_m(missile.position_ecef) <= 0.0 && missile.timer > 1.0 {
+            log_ground_impact_debug(
+                "pre_substep_loop",
+                missile.timer,
+                ellipsoid_height_m(missile.position_ecef),
+            );
+            missile.velocity_ecef = DVec3::ZERO;
+            missile.phase = FlightPhase::Landed;
+            push_landing_history_sample(&mut flight_history, missile.timer);
+            continue;
         }
 
-        // --- 1. Global Field Accelerations ---
-        // Gravity Equation: a = - (G * M) / r^2 * (r_hat)
-        // [Reference: https://en.wikipedia.org/wiki/Newton%27s_law_of_universal_gravitation]
-        let gravity_dir = -missile.position_ecef.normalize();
-        let gravity_accel = gravity_dir * (GRAVITY_CONSTANT / (r * r));
-
-        let v_ecef = missile.velocity_ecef;
-        let r_ecef = missile.position_ecef;
-        
-        // Coriolis Effect: Apparent deflection due to rotating reference frame.
-        // Equation: a_coriolis = -2 * (Omega x v)
-        // [Reference: https://en.wikipedia.org/wiki/Coriolis_force]
-        let coriolis_accel = if settings.coriolis_enabled {
-            -2.0 * EARTH_OMEGA.cross(v_ecef)
+        let h = ellipsoid_height_m(missile.position_ecef);
+        let spd = missile.velocity_ecef.length();
+        let substeps = if h < REENTRY_SUBSTEP_ALT_M && spd > REENTRY_SUBSTEP_SPEED_M_S {
+            REENTRY_SUBSTEPS
         } else {
-            DVec3::ZERO
+            1
         };
-        
-        // Centrifugal Force: Outward apparent force in a rotating reference frame.
-        // Equation: a_centrifugal = - Omega x (Omega x r)
-        // Causes the Earth's equatorial bulge and reduces apparent gravity at the equator.
-        // [Reference: https://en.wikipedia.org/wiki/Centrifugal_force]
-        let centrifugal_accel = if settings.centrifugal_enabled {
-            -EARTH_OMEGA.cross(EARTH_OMEGA.cross(r_ecef))
-        } else {
-            DVec3::ZERO
-        };
+        let sub_dt = frame_dt / substeps as f32;
 
-        // --- 2. Missile-Specific Accelerations ---
-        // Pluggable Model Specific Acceleration (Thrust, Aerodynamic Drag, etc.)
-        // These are calculated in the local frame of the missile based on its state.
-        let (model_accel, new_phase, mass_delta) = missile.model.compute_acceleration(
-            missile.position_ecef, 
-            missile.velocity_ecef, 
-            missile.mass, 
-            missile.timer,
-            dt
-        );
+        let mut landed_this_frame = false;
+        for _ in 0..substeps {
+            if ellipsoid_height_m(missile.position_ecef) <= 0.0 && missile.timer > 1.0 {
+                log_ground_impact_debug(
+                    "inside_substep_before_integrate",
+                    missile.timer,
+                    ellipsoid_height_m(missile.position_ecef),
+                );
+                missile.velocity_ecef = DVec3::ZERO;
+                missile.phase = FlightPhase::Landed;
+                push_landing_history_sample(&mut flight_history, missile.timer);
+                landed_this_frame = true;
+                break;
+            }
 
-        missile.phase = new_phase;
-        missile.mass += mass_delta;
-        missile.timer += dt;
+            let mut pos = missile.position_ecef;
+            let mut vel = missile.velocity_ecef;
+            let mut mass = missile.mass;
+            let mut timer = missile.timer;
+            let new_phase = missile.model.dopri5_substep(
+                &mut pos,
+                &mut vel,
+                &mut mass,
+                &mut timer,
+                sub_dt,
+                settings.coriolis_enabled,
+                settings.centrifugal_enabled,
+            );
+            missile.position_ecef = pos;
+            missile.velocity_ecef = vel;
+            missile.mass = mass;
+            missile.timer = timer;
+            missile.phase = new_phase;
 
-        // --- 3. Numerical Integration ---
-        // Using Semi-Implicit Euler integration for trajectory propagation.
-        // This is a symplectic integrator, meaning it better preserves energy 
-        // over time in orbital/ballistic mechanics compared to explicit Euler.
-        // [Reference: https://en.wikipedia.org/wiki/Semi-implicit_Euler_method]
-        let total_accel = gravity_accel + coriolis_accel + centrifugal_accel + model_accel;
-        
-        // v_{n+1} = v_n + a_n * dt
-        missile.velocity_ecef += total_accel * dt as f64;
-        let vel = missile.velocity_ecef;
-        
-        // x_{n+1} = x_n + v_{n+1} * dt
-        missile.position_ecef += vel * dt as f64;
-        
-        // --- 4. Trajectory Tracking ---
+            if ellipsoid_height_m(missile.position_ecef) <= 0.0 && missile.timer > 1.0 {
+                log_ground_impact_debug(
+                    "inside_substep_after_integrate",
+                    missile.timer,
+                    ellipsoid_height_m(missile.position_ecef),
+                );
+                missile.velocity_ecef = DVec3::ZERO;
+                missile.phase = FlightPhase::Landed;
+                push_landing_history_sample(&mut flight_history, missile.timer);
+                landed_this_frame = true;
+                break;
+            }
+        }
+
+        if landed_this_frame {
+            continue;
+        }
+
+        // --- Trajectory Tracking (once per frame, after substeps) ---
+        // Sample at most once per second via `timer % 1`, but always record the first point after
+        // integration starts. The strict inequality `t % 1 < frame_dt` almost never holds during the
+        // first second when `frame_dt` is large (high time scale), so we used to have 0–1 samples
+        // until t≈1s — a short flight then showed no trail (`path.len() <= 1` and distance < 1 km).
         const MAX_PATH_LEN: usize = 3000;
         const MAX_HISTORY_LEN: usize = 2500;
-        if missile.timer % 1.0 < dt {
+        let t_mod = missile.timer % 1.0;
+        let sample_this_frame =
+            (missile.path.is_empty() && missile.timer > 0.0) || t_mod < frame_dt;
+        if sample_this_frame {
+            if debug && missile.path.len() < 3 {
+                eprintln!(
+                    "[AIBallistic DEBUG] path_sample sim_t={:.4}s t_mod={:.4} frame_dt={:.4} first_pt={} path_len->{} h={:.1}m phase={:?}",
+                    missile.timer,
+                    t_mod,
+                    frame_dt,
+                    missile.path.is_empty() && missile.timer > 0.0,
+                    missile.path.len() + 1,
+                    ellipsoid_height_m(missile.position_ecef),
+                    missile.phase
+                );
+            }
             let pos = missile.position_ecef;
             let phase = missile.phase;
             missile.path.push((pos.as_vec3(), phase));
@@ -499,7 +642,8 @@ fn physics_system(
                 missile.path.drain(0..path_len - MAX_PATH_LEN);
             }
 
-            let altitude_m = (pos.length() - EARTH_RADIUS).max(0.0);
+            let vel = missile.velocity_ecef;
+            let altitude_m = ellipsoid_height_m(pos).max(0.0);
             let alt_km = altitude_m / 1000.0;
             let speed_ms = vel.length();
             let (_, sound_speed, _) = get_isa_properties(altitude_m);
@@ -516,6 +660,42 @@ fn physics_system(
                 flight_history.mach.drain(0..n);
             }
         }
+
+        if emit_periodic_debug {
+            // `h` plus haut est celui d’avant les substeps (choix du nombre de pas) ; ici on veut
+            // l’altitude après intégration, alignée avec `path_sample`.
+            let h_now = ellipsoid_height_m(missile.position_ecef);
+            eprintln!(
+                "[AIBallistic DEBUG] state sim_t={:.3}s h_now={:.1}m (pre_substep_h was {:.1}m) phase={:?} path_pts={} |v|={:.1}m/s mass={:.0}kg substeps={} wall_dt={:.4}s frame_dt={:.4}s time_scale={}",
+                missile.timer,
+                h_now,
+                h,
+                missile.phase,
+                missile.path.len(),
+                missile.velocity_ecef.length(),
+                missile.mass,
+                substeps,
+                time.delta_secs(),
+                frame_dt,
+                settings.time_scale,
+            );
+        }
+    }
+}
+
+/// Ground contact: model does not resolve terminal impact physics; record zero speed / Mach at h≈0.
+fn push_landing_history_sample(flight_history: &mut MissileFlightHistory, timer: f32) {
+    let t = timer as f64;
+    flight_history.altitude.push([t, 0.0]);
+    flight_history.velocity.push([t, 0.0]);
+    flight_history.mach.push([t, 0.0]);
+    const MAX_HISTORY_LEN: usize = 2500;
+    let hist_len = flight_history.velocity.len();
+    if hist_len > MAX_HISTORY_LEN {
+        let n = hist_len - MAX_HISTORY_LEN;
+        flight_history.altitude.drain(0..n);
+        flight_history.velocity.drain(0..n);
+        flight_history.mach.drain(0..n);
     }
 }
 
@@ -599,9 +779,8 @@ fn radar_scan_system(
                         let step_dt = scan_dt / (integration_steps as f32);
                         
                         for _ in 0..integration_steps {
-                            let r = pos.length();
-                            let altitude = (r - EARTH_RADIUS).max(0.0);
-                            let gravity = -pos.normalize() * (GRAVITY_CONSTANT / (r * r));
+                            let altitude = ellipsoid_height_m(pos).max(0.0);
+                            let gravity = gravity_acceleration_ecef(pos);
                             
                             let (rho, sound, _) = get_isa_properties(altitude);
                             let mach = vel.length() / sound;
@@ -659,26 +838,16 @@ fn radar_scan_system(
 }
 
 fn compute_ideal_delta_v(specs: &MissileSpecs) -> f64 {
-    if specs.is_multistage() {
-        let mut total_dv = 0.0;
-        let mut current_mass = specs.total_mass();
-        for stage in &specs.stages {
-            let m_after_burn = current_mass - stage.fuel_mass;
-            if m_after_burn > 0.0 && current_mass > 0.0 {
-                total_dv += stage.isp_vacuum * G0 * (current_mass / m_after_burn).ln();
-            }
-            current_mass = m_after_burn - stage.dry_mass;
+    let mut total_dv = 0.0;
+    let mut current_mass = specs.total_mass();
+    for stage in &specs.stages {
+        let m_after_burn = current_mass - stage.fuel_mass;
+        if m_after_burn > 0.0 && current_mass > 0.0 {
+            total_dv += stage.isp_vacuum * G0 * (current_mass / m_after_burn).ln();
         }
-        total_dv
-    } else {
-        let m0 = specs.dry_mass + specs.fuel_mass;
-        let mf = specs.dry_mass;
-        if mf > 0.0 && m0 > 0.0 {
-            specs.isp_vacuum * G0 * (m0 / mf).ln()
-        } else {
-            0.0
-        }
+        current_mass = m_after_burn - stage.dry_mass;
     }
+    total_dv
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -692,48 +861,36 @@ fn compute_ballistic_impact(
     let dt: f32 = 1.0;
     let mut pos = start_pos;
     let mut vel = start_vel;
-    let mut predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
+    let mut predicted_alt = ellipsoid_height_m(pos).max(0.0);
     let mut iterations = 0;
     const MAX_ITER: usize = 5000;
 
     while predicted_alt > 0.0 && iterations < MAX_ITER {
         iterations += 1;
-        let r = pos.length();
-        let altitude = (r - EARTH_RADIUS).max(0.0);
-
-        let gravity_dir = -pos.normalize();
-        let gravity_accel = gravity_dir * (GRAVITY_CONSTANT / (r * r));
-
-        let coriolis_accel = if settings.coriolis_enabled {
-            -2.0 * EARTH_OMEGA.cross(vel)
-        } else {
-            DVec3::ZERO
-        };
-
-        let centrifugal_accel = if settings.centrifugal_enabled {
-            -EARTH_OMEGA.cross(EARTH_OMEGA.cross(pos))
-        } else {
-            DVec3::ZERO
-        };
-
-        let (rho, sound_speed, _) = get_isa_properties(altitude);
-        let speed = vel.length();
-        let mach = speed / sound_speed;
-        let cd = get_mach_drag(mach);
-
-        let drag_force = -0.5 * rho * (speed * speed) * cd * est_area;
-        let drag_accel = if speed > 1e-3 {
-            (vel.normalize() * drag_force) / est_mass
-        } else {
-            DVec3::ZERO
-        };
-
-        let total_accel = gravity_accel + coriolis_accel + centrifugal_accel + drag_accel;
-
-        vel += total_accel * dt as f64;
-        pos += vel * dt as f64;
-
-        predicted_alt = (pos.length() - EARTH_RADIUS).max(0.0);
+        let mut y = [pos.x, pos.y, pos.z, vel.x, vel.y, vel.z];
+        let co = settings.coriolis_enabled;
+        let ce = settings.centrifugal_enabled;
+        dopri5_step_6(&mut y, 0.0, dt, |_t, s| {
+            let p = DVec3::new(s[0], s[1], s[2]);
+            let v = DVec3::new(s[3], s[4], s[5]);
+            let a_in = inertial_accelerations(p, v, co, ce);
+            let altitude = ellipsoid_height_m(p).max(0.0);
+            let (rho, sound_speed, _) = get_isa_properties(altitude);
+            let speed = v.length();
+            let mach = speed / sound_speed;
+            let cd = get_mach_drag(mach);
+            let drag_force = -0.5 * rho * (speed * speed) * cd * est_area;
+            let drag_accel = if speed > 1e-3 {
+                (v.normalize() * drag_force) / est_mass
+            } else {
+                DVec3::ZERO
+            };
+            let a = a_in + drag_accel;
+            [v.x, v.y, v.z, a.x, a.y, a.z]
+        });
+        pos = DVec3::new(y[0], y[1], y[2]);
+        vel = DVec3::new(y[3], y[4], y[5]);
+        predicted_alt = ellipsoid_height_m(pos).max(0.0);
     }
 
     pos
@@ -967,8 +1124,7 @@ fn abm_guidance_system(
             }
         }
         
-        let r = abm.position_ecef.length();
-        let gravity = -abm.position_ecef.normalize() * (GRAVITY_CONSTANT / (r * r));
+        let gravity = gravity_acceleration_ecef(abm.position_ecef);
         accel += gravity;
         
         let speed = abm.velocity_ecef.length();
@@ -1006,7 +1162,7 @@ fn abm_kill_system(
         let Some(target_ent) = target_ent else { continue; };
         let dist = abm.position_ecef.distance(target_pos);
         if dist < abm.kill_radius {
-            let alt = (target_pos.length() - EARTH_RADIUS) / 1000.0;
+            let alt = ellipsoid_height_m(target_pos).max(0.0) / 1000.0;
             println!("💥 INTERCEPT SUCCESSFUL! Threat neutralized at {:.1} km altitude.", alt);
             
             commands.spawn((
@@ -1639,13 +1795,13 @@ fn egui_stats_system(
     time: Res<Time>,
     window_query: Query<&Window, With<bevy::window::PrimaryWindow>>,
     camera_query: Query<(&Camera, &GlobalTransform), With<Camera3d>>,
-    _settings: Res<SimulationSettings>,
+    mut settings: ResMut<SimulationSettings>,
     mut active_specs: ResMut<ActiveMissileSpecs>,
     mut scenario: ResMut<ScenarioSelection>,
+    mut egui_ui: ResMut<EguiUiState>,
     #[cfg(not(target_arch = "wasm32"))] error_history: Res<ImpactErrorHistory>,
     mut flight_history: ResMut<MissileFlightHistory>,
     registry: Res<MissileRegistry>,
-    mut db_initialized: Local<bool>,
     mut mirv_tracker: ResMut<MirvDeploymentTracker>,
     mut tracked_state: ResMut<TrackedMissileState>,
 ) -> Result {
@@ -1698,61 +1854,115 @@ fn egui_stats_system(
                             scenario.missile_index = scenario.missile_index.min(n - 1);
                             active_specs.0 = registry.0[scenario.missile_index].clone();
                         }
-                        spawn_missile_with_scenario(&mut commands, &active_specs, &scenario);
+                        spawn_missile_with_scenario(&mut commands, &active_specs, &scenario, &settings.boost_pitch);
                     }
                 }
 
                 ui.separator();
-                ui.strong("Scenario");
-                ui.label("Launch → aim (guidance uses aim point at 0 m altitude).");
-                egui::ComboBox::from_id_salt("scenario_launch")
-                    .selected_text(scenario.launch_site.label())
-                    .show_ui(ui, |ui| {
-                        for site in GeoSiteId::ALL {
-                            ui.selectable_value(&mut scenario.launch_site, site, site.label());
-                        }
-                    });
-                egui::ComboBox::from_id_salt("scenario_target")
-                    .selected_text(scenario.target_site.label())
-                    .show_ui(ui, |ui| {
-                        for site in GeoSiteId::ALL {
-                            ui.selectable_value(&mut scenario.target_site, site, site.label());
-                        }
-                    });
-                let n_missiles = registry.0.len();
-                let idx = if n_missiles == 0 {
-                    0
-                } else {
-                    scenario.missile_index.min(n_missiles - 1)
-                };
-                let missile_label = registry
-                    .0
-                    .get(idx)
-                    .map(|s| s.name)
-                    .unwrap_or("(no missiles)");
-                egui::ComboBox::from_id_salt("scenario_missile")
-                    .selected_text(missile_label)
-                    .show_ui(ui, |ui| {
-                        for (i, specs) in registry.0.iter().enumerate() {
-                            ui.selectable_value(&mut scenario.missile_index, i, specs.name);
-                        }
-                    });
-                if ui.button("Respawn with selected scenario").clicked() && n_missiles > 0 {
-                    scenario.missile_index = scenario.missile_index.min(n_missiles - 1);
-                    active_specs.0 = registry.0[scenario.missile_index].clone();
-                    for (ent, _) in missile_query.iter() {
-                        safe_despawn(&mut commands, ent);
+                ui.horizontal(|ui| {
+                    if ui.button("Ouvrir les abbaques").clicked() {
+                        egui_ui.nomogram.window_open = true;
                     }
-                    for (ent, _) in reentry_query.iter() {
-                        safe_despawn(&mut commands, ent);
-                    }
-                    mirv_tracker.deployed_missiles.clear();
-                    flight_history.velocity.clear();
-                    flight_history.mach.clear();
-                    flight_history.altitude.clear();
-                    *tracked_state = TrackedMissileState::default();
-                    spawn_missile_with_scenario(&mut commands, &active_specs, &scenario);
-                }
+                });
+
+                ui.separator();
+                egui::CollapsingHeader::new("Guidage boost (hors missiles.json)")
+                    .id_salt("cmd_center_guidage_boost")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(
+                            "Avant « Début tangage », loft vertical (90°). Ensuite interpolation initiale → finale \
+                             (0° = vers la cible, 90° = zenith).",
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Début tangage (s)");
+                            ui.add(
+                                egui::DragValue::new(&mut settings.boost_pitch.pitch_start_time)
+                                    .speed(0.25)
+                                    .range(0.0..=300.0),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Exponent tangage");
+                            ui.add(
+                                egui::DragValue::new(&mut settings.boost_pitch.pitch_exponent)
+                                    .speed(0.02)
+                                    .range(0.1..=3.0),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Élévation au début tangage (°)");
+                            ui.add(
+                                egui::DragValue::new(&mut settings.boost_pitch.initial_elevation_deg)
+                                    .speed(0.5)
+                                    .range(0.0..=89.9),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Élévation finale (°)");
+                            ui.add(
+                                egui::DragValue::new(&mut settings.boost_pitch.end_elevation_deg)
+                                    .speed(0.5)
+                                    .range(0.0..=89.9),
+                            );
+                        });
+                    });
+
+                ui.separator();
+                egui::CollapsingHeader::new("Scenario")
+                    .id_salt("cmd_center_scenario")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label("Launch → aim (guidance uses aim point at 0 m altitude).");
+                        egui::ComboBox::from_id_salt("scenario_launch")
+                            .selected_text(scenario.launch_site.label())
+                            .show_ui(ui, |ui| {
+                                for site in GeoSiteId::ALL {
+                                    ui.selectable_value(&mut scenario.launch_site, site, site.label());
+                                }
+                            });
+                        egui::ComboBox::from_id_salt("scenario_target")
+                            .selected_text(scenario.target_site.label())
+                            .show_ui(ui, |ui| {
+                                for site in GeoSiteId::ALL {
+                                    ui.selectable_value(&mut scenario.target_site, site, site.label());
+                                }
+                            });
+                        let n_missiles = registry.0.len();
+                        let idx = if n_missiles == 0 {
+                            0
+                        } else {
+                            scenario.missile_index.min(n_missiles - 1)
+                        };
+                        let missile_label = registry
+                            .0
+                            .get(idx)
+                            .map(|s| s.name)
+                            .unwrap_or("(no missiles)");
+                        egui::ComboBox::from_id_salt("scenario_missile")
+                            .selected_text(missile_label)
+                            .show_ui(ui, |ui| {
+                                for (i, specs) in registry.0.iter().enumerate() {
+                                    ui.selectable_value(&mut scenario.missile_index, i, specs.name);
+                                }
+                            });
+                        if ui.button("Respawn with selected scenario").clicked() && n_missiles > 0 {
+                            scenario.missile_index = scenario.missile_index.min(n_missiles - 1);
+                            active_specs.0 = registry.0[scenario.missile_index].clone();
+                            for (ent, _) in missile_query.iter() {
+                                safe_despawn(&mut commands, ent);
+                            }
+                            for (ent, _) in reentry_query.iter() {
+                                safe_despawn(&mut commands, ent);
+                            }
+                            mirv_tracker.deployed_missiles.clear();
+                            flight_history.velocity.clear();
+                            flight_history.mach.clear();
+                            flight_history.altitude.clear();
+                            *tracked_state = TrackedMissileState::default();
+                            spawn_missile_with_scenario(&mut commands, &active_specs, &scenario, &settings.boost_pitch);
+                        }
+                    });
 
                 ui.separator();
 
@@ -1912,6 +2122,146 @@ fn egui_stats_system(
                 }
             });
 
+        // --- Abbaques : portée / apogée vs paramètre de trajectoire (fenêtre séparée) ---
+        {
+            let nomogram = &mut egui_ui.nomogram;
+            let mut abbaques_open = nomogram.window_open;
+            egui::Window::new("Abbaques")
+                .open(&mut abbaques_open)
+                .default_pos([380.0, 10.0])
+                .default_width(440.0)
+                .movable(true)
+                .collapsible(true)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    use egui_plot::{Line, Plot, PlotPoints};
+
+                    ui.label(
+                        "Balayage des élévations de guidage boost. \
+                         Scénario = lancement et cible dans le Command Center, missile actif.",
+                    );
+                    ui.separator();
+
+                    egui::ComboBox::from_id_salt("nomogram_sweep")
+                        .selected_text(nomogram.sweep.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut nomogram.sweep,
+                                NomogramSweepParam::InitialElevationDeg,
+                                NomogramSweepParam::InitialElevationDeg.label(),
+                            );
+                            ui.selectable_value(
+                                &mut nomogram.sweep,
+                                NomogramSweepParam::EndElevationDeg,
+                                NomogramSweepParam::EndElevationDeg.label(),
+                            );
+                        });
+
+                    ui.horizontal(|ui| {
+                        ui.label("min");
+                        ui.add(
+                            egui::DragValue::new(&mut nomogram.param_min)
+                                .speed(0.5)
+                                .range(0.0..=89.9),
+                        );
+                        ui.label("max");
+                        ui.add(
+                            egui::DragValue::new(&mut nomogram.param_max)
+                                .speed(0.5)
+                                .range(0.0..=89.9),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Pas");
+                        ui.add(
+                            egui::DragValue::new(&mut nomogram.steps)
+                                .speed(1)
+                                .range(2usize..=64),
+                        );
+                    });
+
+                    if ui.button("Calculer").clicked() {
+                        nomogram.series.clear();
+                        let launch_ecef = scenario.launch_site.launch_ecef();
+                        let target_ecef = scenario.target_site.aim_ecef();
+                        let sim_params = nomogram_sim_params();
+                        let n = nomogram.steps.max(2);
+                        let mut series = Vec::with_capacity(n);
+                        for i in 0..n {
+                            let t = i as f64 / (n - 1) as f64;
+                            let p = nomogram.param_min + t * (nomogram.param_max - nomogram.param_min);
+                            let specs = active_specs.0.clone();
+                            let mut pitch_scan = settings.boost_pitch;
+                            match nomogram.sweep {
+                                NomogramSweepParam::InitialElevationDeg => {
+                                    pitch_scan.initial_elevation_deg = p;
+                                }
+                                NomogramSweepParam::EndElevationDeg => {
+                                    pitch_scan.end_elevation_deg = p;
+                                }
+                            }
+                            let m = simulate_trajectory_metrics(
+                                specs,
+                                launch_ecef,
+                                target_ecef,
+                                &pitch_scan,
+                                &sim_params,
+                            );
+                            series.push((p, m.ground_range_km, m.apogee_km));
+                        }
+                        nomogram.series = series;
+                        nomogram.status = format!("{n} points calculés.");
+                    }
+
+                    if !nomogram.status.is_empty() {
+                        ui.label(&nomogram.status);
+                    }
+
+                    if nomogram.series.is_empty() {
+                        ui.label("Aucune courbe — cliquez sur « Calculer ».");
+                    } else {
+                        let x_label = nomogram.sweep.label();
+                        let range_pts: PlotPoints = nomogram
+                            .series
+                            .iter()
+                            .map(|(p, r, _)| [*p, *r])
+                            .collect();
+                        let apogee_pts: PlotPoints = nomogram
+                            .series
+                            .iter()
+                            .map(|(p, _, a)| [*p, *a])
+                            .collect();
+
+                        Plot::new("nomogram_range")
+                            .height(180.0)
+                            .x_axis_label(x_label)
+                            .y_axis_label("Portée (km)")
+                            .allow_drag(true)
+                            .allow_zoom(true)
+                            .show(ui, |plot_ui| {
+                                plot_ui.line(
+                                    Line::new("portée", range_pts)
+                                        .color(egui::Color32::from_rgb(80, 180, 255)),
+                                );
+                            });
+
+                        Plot::new("nomogram_apogee")
+                            .height(180.0)
+                            .x_axis_label(x_label)
+                            .y_axis_label("Apogée (km)")
+                            .allow_drag(true)
+                            .allow_zoom(true)
+                            .show(ui, |plot_ui| {
+                                plot_ui.line(
+                                    Line::new("apogée", apogee_pts)
+                                        .color(egui::Color32::from_rgb(255, 160, 80)),
+                                );
+                            });
+                    }
+                });
+            nomogram.window_open = abbaques_open;
+        }
+
         // --- Missile Database Panel (right side) ---
         let db_window = egui::Window::new("Missile Database")
             .default_width(520.0)
@@ -1919,8 +2269,8 @@ fn egui_stats_system(
             .collapsible(true)
             .resizable(true)
             .title_bar(true);
-        let db_window = if !*db_initialized {
-            *db_initialized = true;
+        let db_window = if !egui_ui.missile_db_first_frame {
+            egui_ui.missile_db_first_frame = true;
             db_window.default_pos([ctx.screen_rect().width() - 540.0, 10.0])
         } else {
             db_window
@@ -1963,22 +2313,17 @@ fn egui_stats_system(
                                 };
                                 ui.label(missile_type);
 
-                                let n_stages = if specs.is_multistage() {
-                                    format!("{}", specs.stages.len())
-                                } else {
-                                    "1".into()
-                                };
-                                ui.label(n_stages);
+                                ui.label(format!("{}", specs.stages.len().max(1)));
 
                                 ui.label(format!("{:.0} kg", specs.total_mass()));
-                                ui.label(format!("{:.0} kg", specs.dry_mass));
+                                ui.label(format!("{:.0} kg", specs.total_dry_mass()));
                                 ui.label(format!("{:.0}", specs.total_burn_time()));
 
-                                let isp_vac = if specs.is_multistage() {
+                                let isp_vac = if specs.stages.is_empty() {
+                                    0.0
+                                } else {
                                     let sum: f64 = specs.stages.iter().map(|s| s.isp_vacuum).sum();
                                     sum / specs.stages.len() as f64
-                                } else {
-                                    specs.isp_vacuum
                                 };
                                 ui.label(format!("{:.0} s", isp_vac));
 
@@ -2000,7 +2345,12 @@ fn egui_stats_system(
                 // Expanded detail for active missile
                 ui.strong(format!("Active: {}", active_name));
                 let s = &active_specs.0;
-                if s.is_multistage() {
+                ui.label(format!(
+                    "  Guidage boost : après début tangage {:.1}° → {:.1}° (loft 90° avant)",
+                    settings.boost_pitch.initial_elevation_deg,
+                    settings.boost_pitch.end_elevation_deg
+                ));
+                if !s.stages.is_empty() {
                     for (i, stage) in s.stages.iter().enumerate() {
                         ui.horizontal(|ui| {
                             ui.label(format!(
@@ -2010,13 +2360,23 @@ fn egui_stats_system(
                             ));
                         });
                     }
-                    ui.label(format!("  RV/Payload: {:.0} kg | Area: {:.2} m²", s.dry_mass, s.area));
-                } else {
                     ui.label(format!(
-                        "  Fuel: {:.0} kg | Dry: {:.0} kg | Burn: {:.0}s | Isp {:.0}/{:.0}s | Area: {:.2} m²",
-                        s.fuel_mass, s.dry_mass, s.burn_time,
-                        s.isp_sea_level, s.isp_vacuum, s.area
+                        "  RV/Payload (non-stage): {:.0} kg | Area: {:.2} m²",
+                        s.dry_mass, s.area
                     ));
+                }
+
+                ui.separator();
+                ui.strong("Sources (vehicle class — not engineering certification of sim params)");
+                if let Some(ref q) = s.quality {
+                    ui.label(format!("  quality: {q}"));
+                }
+                if s.url.is_empty() {
+                    ui.label("  (no URLs in JSON)");
+                } else {
+                    for u in &s.url {
+                        ui.label(format!("  • {u}"));
+                    }
                 }
 
                 if let Some(cfg) = &s.mirv {
@@ -2061,9 +2421,7 @@ fn egui_stats_system(
                                 let hit_point = origin + dir * t;
 
                                 let ecef_pos = DVec3::new(hit_point.x as f64, hit_point.y as f64, hit_point.z as f64);
-                                let r = ecef_pos.length();
-                                let lat = (ecef_pos.y / r).asin().to_degrees();
-                                let lon = (-ecef_pos.z).atan2(ecef_pos.x).to_degrees();
+                                let (lat, lon) = ecef_to_geodetic_deg(ecef_pos);
 
                                 let lat_str = if lat >= 0.0 { format!("{:.4}° N", lat) } else { format!("{:.4}° S", -lat) };
                                 let lon_str = if lon >= 0.0 { format!("{:.4}° E", lon) } else { format!("{:.4}° W", -lon) };
@@ -2154,44 +2512,51 @@ fn reentry_body_physics_system(
     for mut body in query.iter_mut() {
         if body.phase == FlightPhase::Landed { continue; }
 
-        let r = body.position_ecef.length();
-        if r < EARTH_RADIUS && body.path.len() > 2 {
+        if ellipsoid_height_m(body.position_ecef) <= 0.0 && body.path.len() > 2 {
             body.velocity_ecef = DVec3::ZERO;
             body.phase = FlightPhase::Landed;
             continue;
         }
 
-        let gravity_dir = -body.position_ecef.normalize();
-        let gravity_accel = gravity_dir * (GRAVITY_CONSTANT / (r * r));
+        let m = body.mass;
+        let ar = body.area;
+        let co = settings.coriolis_enabled;
+        let ce = settings.centrifugal_enabled;
+        let mut y = [
+            body.position_ecef.x,
+            body.position_ecef.y,
+            body.position_ecef.z,
+            body.velocity_ecef.x,
+            body.velocity_ecef.y,
+            body.velocity_ecef.z,
+        ];
+        dopri5_step_6(&mut y, 0.0, dt as f32, |_t, s| {
+            let p = DVec3::new(s[0], s[1], s[2]);
+            let v = DVec3::new(s[3], s[4], s[5]);
+            let a_in = inertial_accelerations(p, v, co, ce);
+            let altitude = ellipsoid_height_m(p).max(0.0);
+            let (rho, sound_speed, _) = get_isa_properties(altitude);
+            let speed = v.length();
+            let mach = speed / sound_speed;
+            let cd = get_mach_drag(mach);
+            let drag_force = -0.5 * rho * speed * speed * cd * ar;
+            let drag_accel = if speed > 1e-3 {
+                (v.normalize() * drag_force) / m
+            } else {
+                DVec3::ZERO
+            };
+            let a = a_in + drag_accel;
+            [v.x, v.y, v.z, a.x, a.y, a.z]
+        });
+        body.position_ecef = DVec3::new(y[0], y[1], y[2]);
+        body.velocity_ecef = DVec3::new(y[3], y[4], y[5]);
 
-        let coriolis_accel = if settings.coriolis_enabled {
-            -2.0 * EARTH_OMEGA.cross(body.velocity_ecef)
-        } else { DVec3::ZERO };
-        let centrifugal_accel = if settings.centrifugal_enabled {
-            -EARTH_OMEGA.cross(EARTH_OMEGA.cross(body.position_ecef))
-        } else { DVec3::ZERO };
-
-        let altitude = (r - EARTH_RADIUS).max(0.0);
-        let (rho, sound_speed, _) = get_isa_properties(altitude);
-        let speed = body.velocity_ecef.length();
-        let mach = speed / sound_speed;
-        let cd = get_mach_drag(mach);
-        let drag_force = -0.5 * rho * speed * speed * cd * body.area;
-        let drag_accel = if speed > 1e-3 {
-            (body.velocity_ecef.normalize() * drag_force) / body.mass
-        } else { DVec3::ZERO };
-
-        let phase = if altitude > 120000.0 || body.velocity_ecef.dot(body.position_ecef) >= 0.0 {
+        let altitude = ellipsoid_height_m(body.position_ecef).max(0.0);
+        body.phase = if altitude > 120_000.0 || body.velocity_ecef.dot(body.position_ecef) >= 0.0 {
             FlightPhase::Ballistic
         } else {
             FlightPhase::ReEntry
         };
-        body.phase = phase;
-
-        let total_accel = gravity_accel + coriolis_accel + centrifugal_accel + drag_accel;
-        body.velocity_ecef += total_accel * dt as f64;
-        let new_vel = body.velocity_ecef;
-        body.position_ecef += new_vel * dt as f64;
 
         let pos_vec3 = body.position_ecef.as_vec3();
         let btype = body.body_type;
@@ -2206,6 +2571,7 @@ fn spawn_missile_with_scenario(
     commands: &mut Commands,
     active_specs: &ActiveMissileSpecs,
     scenario: &ScenarioSelection,
+    pitch: &BoostPitchConfig,
 ) {
     let launch = scenario.launch_site.launch_ecef();
     let aim = scenario.target_site.aim_ecef();
@@ -2219,7 +2585,7 @@ fn spawn_missile_with_scenario(
         timer: 0.0,
         phase: FlightPhase::Boost,
         path: Vec::new(),
-        model: Box::new(BallisticMissilePhysics::new(specs, aim)),
+        model: Box::new(BallisticMissilePhysics::new(specs, aim, *pitch)),
     });
 }
 
